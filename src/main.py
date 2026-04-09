@@ -13,7 +13,6 @@ Verwendung:
 
 import argparse
 import logging
-import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -28,6 +27,7 @@ from market_data import (
     process_ticker, get_vix, get_earnings, build_summary,
 )
 from report_generator import call_claude, build_html, send_email
+from rules import parse_ticker_signals, RULES
 
 
 def setup_logging(verbose: bool) -> None:
@@ -108,21 +108,18 @@ def main() -> int:
     logger.info("[2/3] Marktdaten...")
     t2 = time.monotonic()
 
-    raw = ticker_signals.replace("TICKER_SIGNALS:", "")
-    ticker_directions: dict = {}
-    tickers: list = []
-    for entry in raw.split(","):
-        parts = re.split(r'[:\[]', entry.strip())
-        if len(parts) >= 2:
-            sym, direction = parts[0].strip().upper(), parts[1].strip().upper()
-            if sym and direction in ("CALL", "PUT"):
-                tickers.append(sym)
-                ticker_directions[sym] = direction
-    tickers = list(dict.fromkeys(tickers))[:12]
+    # Robuster Parser via rules.py (ersetzt fragilen Regex-Split)
+    parsed_signals = parse_ticker_signals(ticker_signals)
 
-    if not tickers:
-        logger.error("Keine gültigen Ticker aus Signal geparst: %s", ticker_signals)
+    if not parsed_signals:
+        logger.error("Keine gueltigen Ticker aus Signal geparst: %s", ticker_signals)
         return 1
+
+    ticker_directions: dict = {s["ticker"]: s["direction"] for s in parsed_signals}
+    tickers: list           = list(ticker_directions.keys())
+    logger.info("  Geparste Ticker: %s", ", ".join(
+        t + ":" + d for t, d in ticker_directions.items()
+    ))
 
     finnhub_key = cfg.get("finnhub_key","")
     date_today  = datetime.now().strftime("%Y-%m-%d")
