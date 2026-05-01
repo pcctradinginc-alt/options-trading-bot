@@ -178,6 +178,10 @@ class ReportPayload(BaseModel):
     ev_pct: str | float | None = None
     ev_dollars: str | float | None = None
     breakeven_move_pct: str | float | None = None
+    time_stop: str | None = None
+    time_stop_rule: str | None = None
+    time_stop_hours: int | str | None = None
+    time_stop_required_move_pct: str | float | None = None
     kontrakte: str | int | None = None
     einsatz: int | str | None = None
     stop_loss_eur: int | float | str | None = None
