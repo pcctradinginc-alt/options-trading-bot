@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CIK_CACHE = DATA_DIR / "sec_company_tickers.json"
-SEC_UA = os.environ.get("SEC_USER_AGENT", "DailyOptionsReport/1.0 research@example.com")
+SEC_UA = (os.environ.get("SEC_USER_AGENT") or "DailyOptionsReport/1.0 contact@example.com").strip()
 
 ETF_TICKERS = {
     "TLT", "USO", "GLD", "SLV", "GDX", "SPY", "QQQ", "IWM", "DIA",
@@ -82,11 +82,21 @@ EMPTY_RESULT = {
 
 
 def _headers() -> dict:
-    return {"User-Agent": SEC_UA, "Accept-Encoding": "gzip, deflate", "Host": "data.sec.gov"}
+    # Kein manueller Host-Header: derselbe Helper wird fuer www.sec.gov
+    # und data.sec.gov genutzt. Ein falscher Host verursacht 403.
+    return {
+        "User-Agent": SEC_UA,
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "application/json,text/plain,*/*",
+    }
 
 
 def _archive_headers() -> dict:
-    return {"User-Agent": SEC_UA, "Accept-Encoding": "gzip, deflate"}
+    return {
+        "User-Agent": SEC_UA,
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "application/xml,text/html,text/plain,*/*",
+    }
 
 
 def _get_json(url: str) -> Any:
