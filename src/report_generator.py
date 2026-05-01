@@ -421,9 +421,9 @@ def build_html(d: dict, today: str) -> str:
             f'<div style="max-width:620px;margin:0 auto;padding:32px 16px;">'
             f'<div style="text-align:center;margin-bottom:28px;">'
             f'<p style="margin:0 0 6px 0;font-size:12px;font-weight:600;color:{GR};'
-            f'letter-spacing:0.08em;text-transform:uppercase;">Täglicher Report</p>'
+            f'letter-spacing:0.08em;text-transform:uppercase;">Daily Options Report</p>'
             f'<h1 style="margin:0 0 8px 0;font-size:30px;font-weight:700;color:{DK};">'
-            f'Options Report</h1>'
+            f'Daily Options Report</h1>'
             f'<div style="display:inline-block;background:{WH};border-radius:20px;'
             f'padding:6px 18px;box-shadow:0 1px 6px rgba(0,0,0,0.08);">'
             f'<span style="font-size:14px;color:{GR};">'
@@ -507,7 +507,7 @@ if __name__ == "__main__":
         raise SystemExit("Kein Market Summary angegeben")
 
     today   = datetime.now().strftime("%d.%m.%Y")
-    subject = "📊 Options Report – " + today
+    subject = "📊 Daily Options Report – " + today
 
     data        = call_claude(market_summary, cfg.get("anthropic_api_key",""))
     html_report = build_html(data, today)
