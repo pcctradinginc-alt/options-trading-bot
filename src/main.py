@@ -24,7 +24,7 @@ from market_data import (
     process_ticker, get_vix, get_earnings, build_summary,
 )
 from report_generator import call_claude, build_html, send_email
-from rules import parse_ticker_signals, RULES
+from rules import parse_ticker_signals, RULES, merge_reasons
 from trading_journal import (
     create_run, update_run_context, log_market_signals,
     log_final_decision, update_due_outcomes,
@@ -36,10 +36,14 @@ def setup_logging(verbose: bool) -> None:
     fmt     = "%(asctime)s %(levelname)-8s %(name)s — %(message)s"
     datefmt = "%H:%M:%S"
     logging.basicConfig(level=level, format=fmt, datefmt=datefmt)
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("requests").setLevel(logging.WARNING)
-    logging.getLogger("transformers").setLevel(logging.ERROR)
-    logging.getLogger("torch").setLevel(logging.ERROR)
+    # Third-party libraries can be extremely noisy in GitHub Actions, especially
+    # when FinBERT downloads/checks Hugging Face assets. Keep our app logs useful.
+    for noisy in (
+        "urllib3", "requests", "httpcore", "httpx", "filelock",
+        "huggingface_hub", "huggingface_hub.utils._http",
+        "transformers", "transformers.modeling_utils", "torch",
+    ):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 logger = logging.getLogger(__name__)
@@ -115,7 +119,7 @@ def main() -> int:
     if ticker_signals in ("TICKER_SIGNALS:NONE", ""):
         logger.info("Keine validen Signale heute")
         log_final_decision(run_id, {"no_trade": True, "no_trade_grund": "Kein valides Signal", "vix": vix_value})
-        html    = _no_trade_html(today, vix_value, market_status, clusters[:3])
+        html    = _no_trade_html(today, vix_value, market_status, clusters[:3], reason="Kein valides Signal")
         subject = "⏸️ Daily Options Report – Kein Trade heute – " + today
         _send_or_save(html, subject, cfg, args.dry_run)
         logger.info("Fertig in %.1fs", time.monotonic() - t_start)
@@ -167,6 +171,17 @@ def main() -> int:
 
     market_data = [r for r in results if r]
 
+    # Cluster-/Sentiment-Kontext aus Step 1 an Marktdaten hängen.
+    # Wichtig fuer spaetere Event-Studies: News-Score und Sentiment-Quelle bleiben erhalten,
+    # auch wenn harte Gates den Trade-Score spaeter auf 0 setzen.
+    _enrich_market_data_with_cluster_context(market_data, clusters)
+
+    # PRE-/AFTER-MARKET ist Research-only. Marktdaten werden journalisiert,
+    # aber kein finaler Trade darf freigegeben werden.
+    trade_window_open = (market_status == "OPEN")
+    if not trade_window_open:
+        _apply_market_status_gate(market_data, market_status)
+
     # ── SEC EDGAR Check ───────────────────────────────────
     _run_sec_check(market_data)
 
@@ -189,7 +204,7 @@ def main() -> int:
 
     logger.info("  Marktdaten fertig  (%.1fs)", time.monotonic() - t2)
 
-    if not any(
+    if (not trade_window_open) or not any(
         d.get("score", 0) >= RULES.min_score
         and d.get("_data_quality_ok")
         and d.get("sector_filter_ok", True)
@@ -197,11 +212,16 @@ def main() -> int:
         and d.get("options", {}).get("ev_ok")
         for d in ranked
     ):
-        logger.info("Kein Ticker besteht Datenqualität+Sektor+Score+Liquidität+EV+Earnings-IV-Gates")
+        if not trade_window_open:
+            logger.info("Research-only: Marktstatus %s — keine finale Trade-Freigabe", market_status)
+        else:
+            logger.info("Kein Ticker besteht Datenqualität+Sektor+Score+Liquidität+EV+Earnings-IV-Gates")
         reject_reasons = []
         for d in ranked[:5]:
             reason = d.get("_no_trade_reason") or d.get("_score_reason") or "Gate nicht bestanden"
             reject_reasons.append(f"{d.get('ticker','?')}: {reason}")
+        if not trade_window_open:
+            reject_reasons.insert(0, f"Research-only: Marktstatus {market_status}; keine finale Trade-Freigabe")
         no_trade_reason = " | ".join(reject_reasons)[:500] or "Kein Kandidat mit positivem Options EV"
         data = {
             "datum": today, "vix": str(vix_value), "regime": "TRENDING",
@@ -210,7 +230,7 @@ def main() -> int:
             "ticker_tabelle": [],
         }
         log_final_decision(run_id, data)
-        html_report = _no_trade_html(today, vix_value, market_status, clusters[:3])
+        html_report = _no_trade_html(today, vix_value, market_status, clusters[:3], reason=no_trade_reason)
         subject = "⏸️ Daily Options Report – No Trade – " + today
         _send_or_save(html_report, subject, cfg, args.dry_run)
         logger.info("Fertig in %.1fs", time.monotonic() - t_start)
@@ -245,6 +265,39 @@ def main() -> int:
     _send_or_save(html_report, subject, cfg, args.dry_run)
     logger.info("Fertig in %.1fs", time.monotonic() - t_start)
     return 0
+
+
+
+def _best_cluster_for_ticker(clusters: list, ticker: str) -> dict:
+    matches = [c for c in (clusters or []) if c.get("ticker") == ticker]
+    if not matches:
+        return {}
+    return sorted(matches, key=lambda c: c.get("confidence_score", 0), reverse=True)[0]
+
+
+def _enrich_market_data_with_cluster_context(market_data: list, clusters: list) -> None:
+    for d in market_data:
+        c = _best_cluster_for_ticker(clusters, d.get("ticker", ""))
+        if not c:
+            continue
+        d["news_confidence_score"] = c.get("confidence_score")
+        d["news_sentiment_score"] = c.get("sentiment_score")
+        d["news_sentiment_source"] = c.get("sentiment_source", "keyword")
+        d["news_headline_repr"] = c.get("headline_repr", "")
+        d["news_event_type"] = c.get("event_type", "")
+
+
+def _apply_market_status_gate(market_data: list, market_status: str) -> None:
+    reason = f"Research-only: Marktstatus {market_status}; keine finale Trade-Freigabe"
+    for d in market_data:
+        d["market_status_trade_allowed"] = False
+        d["market_status_gate_reason"] = reason
+        d["raw_signal_score"] = d.get("raw_signal_score", d.get("score", 0.0))
+        d["gate_adjusted_score"] = d.get("gate_adjusted_score", d.get("score", 0.0))
+        d["_no_trade_reason"] = merge_reasons(d.get("_no_trade_reason", ""), reason)
+        d["_score_reason"] = merge_reasons(d.get("_score_reason", ""), "market_status_research_only")
+        # Finaler Trade-Score wird auf 0 gesetzt, aber raw_signal_score bleibt erhalten.
+        d["score"] = 0.0
 
 
 # ══════════════════════════════════════════════════════════
@@ -303,7 +356,7 @@ def _send_or_save(html: str, subject: str, cfg: dict, dry_run: bool) -> None:
 
 
 def _no_trade_html(today: str, vix=None, market_status: str = "",
-                   clusters: list = None) -> str:
+                   clusters: list = None, reason: str = "Kein valides Signal") -> str:
     vix_str    = str(vix) if vix and vix != "n/v" else "n/v"
     status_str = market_status or "unbekannt"
     clusters   = clusters or []
@@ -380,7 +433,7 @@ def _no_trade_html(today: str, vix=None, market_status: str = "",
         '<div style="display:flex;justify-content:space-between;align-items:center;'
         'padding:10px 0;">'
         '<span style="font-size:14px;color:#86868b;">Grund</span>'
-        '<span style="font-size:14px;color:#1d1d1f;">Kein valides Signal</span>'
+        f'<span style="font-size:14px;color:#1d1d1f;text-align:right;max-width:280px;">{reason}</span>'
         '</div>'
         '</div>'
         + cluster_section +
