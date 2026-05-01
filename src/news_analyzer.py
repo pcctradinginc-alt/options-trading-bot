@@ -7,7 +7,6 @@ v4 Änderungen:
 - Alle v3 Änderungen enthalten: BBC, WSJ, Nasdaq, DECAY 0.18, etc.
 """
 
-import hashlib
 import logging
 import math
 import re
@@ -18,6 +17,9 @@ from datetime import datetime, timedelta, timezone
 import requests
 from requests.exceptions import RequestException, Timeout
 
+from market_calendar import market_context
+from news_utils import article_fingerprint, canonicalize_url, near_duplicate_key
+
 logger = logging.getLogger(__name__)
 
 # Optionale finBERT Integration — Fail-safe
@@ -27,6 +29,12 @@ except ImportError:
     FINBERT_AVAILABLE = False
     def get_finbert_sentiment_batch(texts):
         return [0.0] * len(texts)
+
+try:
+    from universe import get_known_tickers
+except ImportError:
+    def get_known_tickers(fallback=None):
+        return fallback or set()
 
 
 # ══════════════════════════════════════════════════════════
@@ -85,7 +93,7 @@ KEYWORDS = {
     "default": 3,
 }
 
-KNOWN_TICKERS = {
+DEFAULT_TICKERS = {
     "AAPL","MSFT","GOOGL","GOOG","AMZN","NVDA","META","TSLA","BRK","JPM","V",
     "XOM","JNJ","WMT","PG","MA","HD","CVX","MRK","ABBV","PEP","KO",
     "AVGO","COST","MCD","TMO","ACN","ABT","DHR","LIN","TXN","PM",
@@ -103,6 +111,9 @@ KNOWN_TICKERS = {
     "PLTR","ARM","CRWD","MRVL","SMCI",
     "KTOS","WDC","RDDT",
 }
+
+# Dynamisch aus Nasdaq Trader; Fallback bleibt die bisherige Liste.
+KNOWN_TICKERS = get_known_tickers(DEFAULT_TICKERS)
 
 TICKER_ALIASES = {
     "J&J": "JNJ", "Johnson & Johnson": "JNJ",
@@ -259,18 +270,8 @@ def sentiment_multiplier(avg_sentiment: float) -> float:
 
 
 def get_market_context() -> tuple:
-    now_utc = datetime.now(timezone.utc)
-    offset  = -4 if 3 <= now_utc.month <= 11 else -5
-    now_et  = now_utc + timedelta(hours=offset)
-    hour    = now_et.hour + now_et.minute / 60
-    weekday = now_et.weekday()
-    if weekday >= 5:           status = "CLOSED-WEEKEND"
-    elif 9.5 <= hour < 16.0:  status = "OPEN"
-    elif 4.0 <= hour < 9.5:   status = "PRE-MARKET"
-    elif 16.0 <= hour < 20.0: status = "AFTER-HOURS"
-    else:                      status = "CLOSED"
-    days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-    return days[weekday] + " " + now_et.strftime("%H:%M") + " ET", status
+    # DST-/Zeitzonen-sicher via zoneinfo, optional exchange_calendars.
+    return market_context()
 
 
 def parse_pub_date(date_str: str) -> datetime:
@@ -303,6 +304,7 @@ def fetch_one_feed(feed: dict) -> list:
             title   = item.findtext("title", "").strip()
             summary = re.sub(r'<[^>]+>', '',
                              item.findtext("description", ""))[:300].strip()
+            link    = canonicalize_url(item.findtext("link", "").strip())
             pub_dt  = parse_pub_date(item.findtext("pubDate", ""))
             if pub_dt < cutoff or not title:
                 continue
@@ -319,7 +321,9 @@ def fetch_one_feed(feed: dict) -> list:
                 if alias.lower() in (title + " " + summary).lower() and sym not in tickers:
                     tickers.append(sym)
             result.append({
-                "hash":         hashlib.md5(title[:60].encode()).hexdigest()[:8],
+                "hash":         article_fingerprint(title, link, summary),
+                "dedupe_key":   near_duplicate_key(title),
+                "url":          link,
                 "title":        title,
                 "summary":      summary[:200],
                 "source":       feed["name"],
@@ -345,18 +349,24 @@ def fetch_one_feed(feed: dict) -> list:
 
 
 def fetch_all_feeds() -> list:
-    all_articles, seen = [], set()
+    all_articles, seen_hashes, seen_titles = [], set(), set()
     with ThreadPoolExecutor(max_workers=12) as ex:
         futures = [ex.submit(fetch_one_feed, feed) for feed in FEEDS]
         for f in as_completed(futures, timeout=10):
             try:
                 for art in f.result():
-                    if art["hash"] not in seen:
-                        seen.add(art["hash"])
-                        all_articles.append(art)
+                    h = art.get("hash")
+                    k = art.get("dedupe_key")
+                    if h in seen_hashes or (k and k in seen_titles):
+                        continue
+                    seen_hashes.add(h)
+                    if k:
+                        seen_titles.add(k)
+                    all_articles.append(art)
             except Exception as e:
                 logger.debug("Feed-Future Fehler: %s", e)
-    logger.info("%d Artikel aus %d Feeds geladen", len(all_articles), len(FEEDS))
+    logger.info("%d Artikel aus %d Feeds geladen | Universe=%d Ticker",
+                len(all_articles), len(FEEDS), len(KNOWN_TICKERS))
     return all_articles
 
 
@@ -413,7 +423,7 @@ def cluster_articles(articles: list, earnings_map: dict) -> list:
             clusters[key] = {
                 "ticker":       art["tickers"][0] if art["tickers"] else fallback,
                 "event_type":   art["keywords"][0] if art["keywords"] else "general",
-                "articles":     [], "sources": [],
+                "articles":     [], "sources": [], "urls": [],
                 "min_age":      art["age_min"],
                 "kw_score_sum": 0,
                 "top_headline": art["title"],
@@ -421,6 +431,8 @@ def cluster_articles(articles: list, earnings_map: dict) -> list:
         c = clusters[key]
         c["articles"].append(art)
         c["sources"].append({"name": art["source"], "tier": art["tier"]})
+        if art.get("url"):
+            c["urls"].append(art["url"])
         c["min_age"]       = min(c["min_age"], art["age_min"])
         c["kw_score_sum"] += art["kw_score"]
 
@@ -454,6 +466,7 @@ def cluster_articles(articles: list, earnings_map: dict) -> list:
             "event_type":       c["event_type"],
             "artikel_anzahl":   n,
             "quellen":          list({s["name"] for s in c["sources"]}),
+            "url_anzahl":       len(set(c.get("urls", []))),
             "feed_tier_max":    tier,
             "alter_minuten":    c["min_age"],
             "sentiment_score":  round(avg_sentiment, 2),
@@ -511,6 +524,7 @@ def format_clusters_for_claude(clusters: list) -> str:
             " | EVENT_TYPE:" + c["event_type"] +
             " | ARTIKEL_ANZAHL:" + str(c["artikel_anzahl"]) +
             " | FEED_TIER_MAX:" + str(c["feed_tier_max"]) +
+            " | URL_ANZAHL:" + str(c.get("url_anzahl", 0)) +
             " | ALTER_MINUTEN:" + str(c["alter_minuten"]) +
             " | CONFIDENCE:" + str(c["confidence_score"]) +
             " | DECAY:" + str(c["decay_avg"]) +
