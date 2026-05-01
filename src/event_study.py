@@ -19,7 +19,7 @@ from pathlib import Path
 from trading_journal import DB_PATH, connect
 
 
-VALID_GROUPS = {"base", "sector", "sentpx", "ev_bucket", "ivrv_bucket", "iv_rank_bucket", "data_quality"}
+VALID_GROUPS = {"base", "sector", "sector_momentum", "sentpx", "ev_bucket", "ivrv_bucket", "iv_rank_bucket", "data_quality"}
 
 
 def fetch_rows(selected_only: bool = False):
@@ -30,6 +30,7 @@ def fetch_rows(selected_only: bool = False):
         SELECT s.ticker, s.direction, s.signal_strength, s.score, s.score_reason,
                s.ev_ok, s.ev_pct, s.ev_dollars, s.selected_trade,
                s.sector, s.sector_etf, s.sector_filter_ok, s.sector_filter_reason,
+               s.sector_vs_market_pct, s.sector_momentum_confirmation,
                s.sentiment_price_label, s.sentiment_price_score_adjustment,
                s.data_quality_ok, s.data_quality_reason, s.data_quality_score,
                s.iv_to_rv, s.option_iv, s.iv_rank, s.iv_percentile, s.iv_history_count, s.no_trade_reason,
@@ -101,6 +102,8 @@ def _group_key(row, group: str):
     selected = "selected" if row["selected_trade"] else "all"
     if group == "sector":
         bucket = row["sector_etf"] or row["sector"] or "unknown"
+    elif group == "sector_momentum":
+        bucket = row["sector_momentum_confirmation"] or "unknown"
     elif group == "sentpx":
         bucket = row["sentiment_price_label"] or "unknown"
     elif group == "ev_bucket":
@@ -156,7 +159,7 @@ def main():
     parser.add_argument("--selected-only", action="store_true", help="nur finale Trade-Auswahl")
     parser.add_argument("--csv", help="CSV Export-Pfad")
     parser.add_argument("--group", default="base", choices=sorted(VALID_GROUPS),
-                        help="Gruppierung: base, sector, sentpx, ev_bucket, ivrv_bucket, iv_rank_bucket, data_quality")
+                        help="Gruppierung: base, sector, sector_momentum, sentpx, ev_bucket, ivrv_bucket, iv_rank_bucket, data_quality")
     args = parser.parse_args()
 
     if not DB_PATH.exists():
