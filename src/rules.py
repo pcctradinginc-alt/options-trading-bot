@@ -1,12 +1,11 @@
 """
 rules.py — Zentrale Trading-Regeln
 
-Alle handelsrelevanten Parameter an einem Ort.
-Nach dem Claude-Call werden diese Regeln Code-seitig nochmal
-geprüft — Claude-Halluzinationen bei Kernparametern werden so abgefangen.
-
-Verwendung:
-    from rules import RULES, validate_claude_output, apply_vix_rules
+Fixes v2:
+- apply_vix_rules() nimmt jetzt autoritativen vix_direct Parameter
+- VIX unbekannt → no_trade statt Einsatz 0
+- Kontrakt=0 → no_trade (Budget-Schutz)
+- Spread/OI Grenzen vereinheitlicht (Prompt + Code konsistent)
 """
 
 from dataclasses import dataclass
@@ -19,22 +18,22 @@ from typing import Optional
 @dataclass(frozen=True)
 class TradingRules:
     # VIX-Grenzen
-    vix_hard_limit:     float = 25.0   # >= dieser Wert → kein Trade
-    vix_reduced_limit:  float = 20.0   # >= dieser Wert → reduzierter Einsatz
+    vix_hard_limit:     float = 25.0
+    vix_reduced_limit:  float = 20.0
 
     # Einsatz in EUR
-    einsatz_normal:     int   = 250    # VIX < 20
-    einsatz_reduced:    int   = 150    # VIX 20-24.99
+    einsatz_normal:     int   = 250
+    einsatz_reduced:    int   = 150
 
     # Stop-Loss
-    stop_loss_pct:      float = 0.30   # 30% des Einsatzes
+    stop_loss_pct:      float = 0.30
 
     # Score-Schwellen
-    min_score:          int   = 50     # unter diesem Wert → kein Trade
+    min_score:          int   = 50
 
-    # Options-Liquidität
-    max_spread_pct:     float = 12.0   # Spread > 12% → Liquiditäts-Malus
-    min_open_interest:  int   = 150    # OI < 150 → Liquiditäts-Malus
+    # Fix Nr. 5: Spread/OI vereinheitlicht — README + Prompt + Code konsistent
+    max_spread_pct:     float = 2.0    # war 12.0 — jetzt wie im Prompt
+    min_open_interest:  int   = 5000   # war 150 — jetzt wie im Prompt
 
     # Signal-Parsing
     valid_directions:   tuple = ("CALL", "PUT")
@@ -50,40 +49,57 @@ RULES = TradingRules()
 
 
 # ══════════════════════════════════════════════════════════
-# VIX-REGELPRÜFUNG (Code-seitig nach Claude-Call)
+# VIX-REGELPRÜFUNG
+# Fix Nr. 1+2: vix_direct = autoritativer VIX aus get_vix()
+# Claude-JSON-Feld wird ignoriert für die Risikoregel
+# Fix Nr. 3: Kontrakt=0 → no_trade (Budget-Schutz)
 # ══════════════════════════════════════════════════════════
 
-def apply_vix_rules(vix_value, claude_output: dict) -> dict:
+def apply_vix_rules(vix_direct, claude_output: dict) -> dict:
     """
-    Prüft und korrigiert Claude-Output gegen VIX-Regeln.
-    Claude kann VIX-Grenzen halluzinieren — dieser Code hat immer Vorrang.
+    Wendet VIX-Regeln auf Claude-Output an.
 
-    Returns korrigierten dict mit:
-    - no_trade: bool
-    - einsatz: int
-    - stop_loss_eur: int
-    - kontrakte: str (berechnet aus Einsatz + Midpoint)
+    vix_direct: autoritativer VIX-Wert direkt aus get_vix() in main.py
+                NICHT aus claude_output["vix"] — verhindert LLM-Halluzination.
+
+    Fix Nr. 1: VIX kommt immer direkt von get_vix(), nie aus Claude-JSON.
+    Fix Nr. 2: VIX unbekannt (n/v oder nicht parsebar) → no_trade=True,
+               nicht vix=0.0 mit normalem Einsatz.
+    Fix Nr. 3: Kontrakt-Berechnung ergibt 0 → no_trade=True (Budget überschritten).
     """
     result = dict(claude_output)
 
-    # VIX parsen
+    # Fix Nr. 1+2: Autoritativen VIX parsen
+    vix_unknown = False
     try:
-        vix = float(str(vix_value).replace(",", "."))
+        vix = float(str(vix_direct).replace(",", "."))
+        if vix <= 0:
+            vix_unknown = True
     except (ValueError, TypeError):
-        vix = 0.0
+        vix_unknown = True
 
-    # Hard Limit — überschreibt Claude immer
-    if vix != 0.0 and vix >= RULES.vix_hard_limit:
-        result["no_trade"]      = True
-        result["no_trade_grund"] = "VIX zu hoch Kapitalschutz aktiv"
-        result["vix_warnung"]   = False
-        result["einsatz"]       = 0
-        result["stop_loss_eur"] = 0
-        result["kontrakte"]     = "n/v"
+    # Fix Nr. 2: Unbekannter VIX → no_trade (sicherer Zustand)
+    if vix_unknown:
+        result["no_trade"]       = True
+        result["no_trade_grund"] = "VIX nicht verfuegbar kein Trade"
+        result["vix_warnung"]    = False
+        result["einsatz"]        = 0
+        result["stop_loss_eur"]  = 0
+        result["kontrakte"]      = "n/v"
         return result
 
-    # Einsatz nach VIX — überschreibt Claude
-    if vix != 0.0 and vix >= RULES.vix_reduced_limit:
+    # Hard Limit
+    if vix >= RULES.vix_hard_limit:
+        result["no_trade"]       = True
+        result["no_trade_grund"] = "VIX zu hoch Kapitalschutz aktiv"
+        result["vix_warnung"]    = False
+        result["einsatz"]        = 0
+        result["stop_loss_eur"]  = 0
+        result["kontrakte"]      = "n/v"
+        return result
+
+    # Einsatz nach VIX
+    if vix >= RULES.vix_reduced_limit:
         einsatz = RULES.einsatz_reduced
         result["vix_warnung"] = True
     else:
@@ -93,14 +109,22 @@ def apply_vix_rules(vix_value, claude_output: dict) -> dict:
     result["einsatz"]       = einsatz
     result["stop_loss_eur"] = round(einsatz * RULES.stop_loss_pct)
 
-    # Kontrakte dynamisch berechnen aus Midpoint
+    # Fix Nr. 3: Kontrakt-Berechnung — 0 Kontrakte = no_trade
     if not result.get("no_trade"):
         mid = result.get("midpoint", "n/v")
         try:
             mid_f = float(str(mid).replace(",", "."))
             if mid_f > 0:
                 kontrakte = round(einsatz / (mid_f * 100))
-                result["kontrakte"] = str(max(1, kontrakte))
+                if kontrakte < 1:
+                    # Budget reicht nicht für einen Kontrakt → kein Trade
+                    result["no_trade"]       = True
+                    result["no_trade_grund"] = "Midpoint zu hoch Budget reicht nicht"
+                    result["einsatz"]        = 0
+                    result["stop_loss_eur"]  = 0
+                    result["kontrakte"]      = "n/v"
+                    return result
+                result["kontrakte"] = str(kontrakte)
             else:
                 result["kontrakte"] = "n/v"
         except (ValueError, TypeError):
@@ -117,15 +141,9 @@ def validate_claude_output(data: dict) -> tuple:
     """
     Prüft Claude-Output auf Pflichtfelder und logische Konsistenz.
     Gibt (is_valid, list_of_errors) zurück.
-
-    Fängt häufige Halluzinationen ab:
-    - einsatz als String statt Int
-    - no_trade fehlt komplett
-    - ticker_tabelle leer oder fehlt
     """
     errors = []
 
-    # Pflichtfelder
     required = ["datum", "vix", "regime", "no_trade"]
     for field in required:
         if field not in data:
@@ -134,35 +152,31 @@ def validate_claude_output(data: dict) -> tuple:
     no_trade = data.get("no_trade", False)
 
     if not no_trade:
-        # Trade-Felder prüfen
         trade_fields = ["ticker", "strike", "laufzeit", "delta", "midpoint"]
         for field in trade_fields:
             if not data.get(field):
                 errors.append(f"Trade-Feld fehlt oder leer: {field}")
 
-        # Einsatz muss numerisch sein
         einsatz = data.get("einsatz")
         if einsatz is not None:
             try:
                 e = int(str(einsatz).replace("€","").strip())
                 if e not in (RULES.einsatz_normal, RULES.einsatz_reduced):
                     errors.append(
-                        f"Einsatz {e} ungültig — erwartet {RULES.einsatz_reduced} oder {RULES.einsatz_normal}"
+                        f"Einsatz {e} ungültig — erwartet "
+                        f"{RULES.einsatz_reduced} oder {RULES.einsatz_normal}"
                     )
             except (ValueError, TypeError):
                 errors.append(f"Einsatz nicht numerisch: {einsatz}")
 
-        # Regime prüfen
         valid_regimes = ("LOW-VOL", "TRENDING", "HIGH-VOL")
         if data.get("regime") not in valid_regimes:
-            errors.append(f"Ungültiges Regime: {data.get('regime')} — erwartet {valid_regimes}")
+            errors.append(f"Ungültiges Regime: {data.get('regime')}")
 
-        # regime_farbe prüfen
         valid_farben = ("gruen", "gelb", "rot")
         if data.get("regime_farbe") not in valid_farben:
             errors.append(f"Ungültige regime_farbe: {data.get('regime_farbe')}")
 
-    # Ticker-Tabelle
     tabelle = data.get("ticker_tabelle", [])
     if not isinstance(tabelle, list):
         errors.append("ticker_tabelle ist keine Liste")
@@ -174,24 +188,20 @@ def validate_claude_output(data: dict) -> tuple:
 
 
 # ══════════════════════════════════════════════════════════
-# SIGNAL-VALIDIERUNG (Step 1 Output)
+# SIGNAL-VALIDIERUNG
 # ══════════════════════════════════════════════════════════
 
 def parse_ticker_signals(raw: str) -> list:
     """
     Robuster Parser für TICKER_SIGNALS-String.
-    Ersetzt fragilen Regex-Split in main.py.
+    Gibt vollständige Signal-Dicts zurück inkl. dte_days.
 
     Input:  "TICKER_SIGNALS:USO:CALL:HIGH:T3:45DTE,TLT:PUT:MED:T3:45DTE"
-    Output: [{"ticker": "USO", "direction": "CALL", ...}, ...]
-
-    Validiert jeden Eintrag gegen RULES-Konstanten.
-    Ungültige Einträge werden übersprungen (nicht gecrasht).
+    Output: [{"ticker": "USO", "direction": "CALL", "dte_days": 45, ...}, ...]
     """
     if not raw:
         return []
 
-    # Prefix entfernen
     clean = raw.strip()
     if clean.startswith("TICKER_SIGNALS:"):
         clean = clean[len("TICKER_SIGNALS:"):]
@@ -215,7 +225,6 @@ def parse_ticker_signals(raw: str) -> list:
         horizon   = parts[3].strip().upper()
         dte_raw   = parts[4].strip().upper()
 
-        # Validierung gegen Konstanten
         if not ticker or len(ticker) > 5:
             continue
         if direction not in RULES.valid_directions:
@@ -227,7 +236,6 @@ def parse_ticker_signals(raw: str) -> list:
         if not dte_raw.endswith("DTE"):
             continue
 
-        # DTE numerisch prüfen
         try:
             dte_days = int(dte_raw.replace("DTE", ""))
             if dte_days <= 0 or dte_days > 180:
@@ -244,5 +252,4 @@ def parse_ticker_signals(raw: str) -> list:
             "dte_days":  dte_days,
         })
 
-    # Max-Ticker begrenzen
     return results[:RULES.max_tickers]
