@@ -92,6 +92,11 @@ def init_db(con: sqlite3.Connection) -> None:
             change_pct REAL,
             rel_vol TEXT,
             score REAL,
+            raw_signal_score REAL,
+            gate_adjusted_score REAL,
+            news_confidence_score REAL,
+            news_sentiment_score REAL,
+            news_sentiment_source TEXT,
             score_reason TEXT,
             liquidity_fail INTEGER,
             liquidity_reason TEXT,
@@ -174,6 +179,11 @@ def init_db(con: sqlite3.Connection) -> None:
         """
     )
     _ensure_columns(con, "signals", {
+        "raw_signal_score": "REAL",
+        "gate_adjusted_score": "REAL",
+        "news_confidence_score": "REAL",
+        "news_sentiment_score": "REAL",
+        "news_sentiment_source": "TEXT",
         "data_quality_ok": "INTEGER",
         "data_quality_reason": "TEXT",
         "no_trade_reason": "TEXT",
@@ -282,7 +292,9 @@ def log_market_signals(run_id: int, parsed_signals: list[dict], market_data: lis
     columns = [
         "run_id", "created_at", "ticker", "direction", "signal_strength", "horizon", "dte_days",
         "cluster_json", "market_json", "option_json", "sec_json", "price", "change_pct", "rel_vol",
-        "score", "score_reason", "liquidity_fail", "liquidity_reason", "ev_ok", "ev_pct",
+        "score", "raw_signal_score", "gate_adjusted_score", "news_confidence_score",
+        "news_sentiment_score", "news_sentiment_source", "score_reason", "liquidity_fail",
+        "liquidity_reason", "ev_ok", "ev_pct",
         "ev_dollars", "conservative_entry", "data_quality_ok", "data_quality_reason",
         "no_trade_reason", "quote_source", "option_source", "realized_vol_20d", "option_iv",
         "iv_to_rv", "exit_slippage_points", "earnings_iv_ok", "earnings_iv_reason",
@@ -308,11 +320,16 @@ def log_market_signals(run_id: int, parsed_signals: list[dict], market_data: lis
                 "sec_reason": d.get("sec_reason"),
                 "sec_confidence": d.get("sec_confidence"),
             }
+            cluster = _cluster_for_ticker(clusters, ticker)
             values = [
                 run_id, iso(created), ticker, d.get("news_direction") or ps.get("direction"),
                 ps.get("score"), ps.get("horizon"), ps.get("dte_days"),
-                _json(_cluster_for_ticker(clusters, ticker)), _json(d), _json(opt), _json(sec),
+                _json(cluster), _json(d), _json(opt), _json(sec),
                 d.get("price"), d.get("change_pct"), str(d.get("rel_vol")), d.get("score"),
+                d.get("raw_signal_score"), d.get("gate_adjusted_score"),
+                d.get("news_confidence_score", cluster.get("confidence_score")),
+                d.get("news_sentiment_score", cluster.get("sentiment_score")),
+                d.get("news_sentiment_source", cluster.get("sentiment_source")),
                 d.get("_score_reason"), 1 if d.get("_liquidity_fail") else 0,
                 d.get("_liquidity_reason", ""), 1 if opt.get("ev_ok") else 0,
                 opt.get("ev_pct"), opt.get("ev_dollars"), opt.get("conservative_entry"),
