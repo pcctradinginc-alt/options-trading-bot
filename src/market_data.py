@@ -1,21 +1,21 @@
 """
 market_data.py — Marktdaten + Score-Berechnung (Step 2)
 
-Fixes v2:
-- get_tradier_options() nimmt target_dte Parameter (Fix Nr. 6)
-- Spread/OI Liquiditäts-Malus nutzt RULES-Konstanten (Fix Nr. 5)
+Fixes v3:
+- Liquidität als harter Filter via check_liquidity() (nicht Malus)
+- Fail-Closed: fehlende Bid/Ask/Midpoint → score=0, _liquidity_fail=True
+- get_tradier_options() nutzt target_dte
 - Logging statt print()
 """
 
 import logging
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from datetime import datetime, timedelta
 
 import requests
 from requests.exceptions import RequestException, Timeout
 
-from rules import RULES
+from rules import RULES, check_liquidity
 
 logger = logging.getLogger(__name__)
 
@@ -30,9 +30,9 @@ USER_AGENTS = [
     "python-requests/2.31.0",
 ]
 
-MARKET_OPEN_UTC_H             = 13.5
-MARKET_CLOSE_UTC_H            = 20.0
-VOLUME_EXTRAPOLATION_DELAY_H  = 0.5
+MARKET_OPEN_UTC_H            = 13.5
+MARKET_CLOSE_UTC_H           = 20.0
+VOLUME_EXTRAPOLATION_DELAY_H = 0.5
 
 
 # ══════════════════════════════════════════════════════════
@@ -62,7 +62,8 @@ def get_quote_alphavantage(symbol, api_key):
         if not api_key:
             return None
         r = robust_get("https://www.alphavantage.co/query",
-                       params={"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": api_key})
+                       params={"function": "GLOBAL_QUOTE", "symbol": symbol,
+                               "apikey": api_key})
         if not r:
             return None
         q = r.json().get("Global Quote", {})
@@ -107,8 +108,9 @@ def get_quote_yahoo_v8(symbol):
     try:
         r = None
         for host in ["query1", "query2"]:
-            r = robust_get("https://" + host + ".finance.yahoo.com/v8/finance/chart/" + symbol,
-                           params={"interval": "1d", "range": "5d"})
+            r = robust_get(
+                "https://" + host + ".finance.yahoo.com/v8/finance/chart/" + symbol,
+                params={"interval": "1d", "range": "5d"})
             if r:
                 break
         if not r:
@@ -186,8 +188,8 @@ def get_history(symbol, cfg):
 
     try:
         now_utc_h = datetime.utcnow().hour + datetime.utcnow().minute / 60.0
-        market_open_with_delay = MARKET_OPEN_UTC_H + VOLUME_EXTRAPOLATION_DELAY_H
-        if market_open_with_delay <= now_utc_h < MARKET_CLOSE_UTC_H and volumes:
+        delay     = MARKET_OPEN_UTC_H + VOLUME_EXTRAPOLATION_DELAY_H
+        if delay <= now_utc_h < MARKET_CLOSE_UTC_H and volumes:
             elapsed  = now_utc_h - MARKET_OPEN_UTC_H
             fraction = max(0.1, elapsed / 6.5)
             volumes  = volumes.copy()
@@ -264,16 +266,10 @@ def get_earnings(start, end, finnhub_key):
 
 # ══════════════════════════════════════════════════════════
 # TRADIER OPTIONS
-# Fix Nr. 6: target_dte Parameter — DTE aus Claude-Signal wird genutzt
-# Fix Nr. 5: Spread/OI Grenzen aus RULES (konsistent mit Prompt)
 # ══════════════════════════════════════════════════════════
 
 def get_tradier_options(symbol, direction, tradier_token,
                         sandbox=True, target_dte=21) -> dict:
-    """
-    Fix Nr. 6: target_dte wird jetzt übergeben und genutzt.
-    Sucht Expiration die am nächsten an target_dte liegt (±14 Tage Toleranz).
-    """
     try:
         if not tradier_token:
             return {}
@@ -292,11 +288,9 @@ def get_tradier_options(symbol, direction, tradier_token,
         today_dt   = datetime.now()
         target_exp = None
         best_diff  = 999
-
-        # Fix Nr. 6: Nächste Expiration zum gewünschten DTE suchen
         for exp in exps:
             days = (datetime.strptime(exp, "%Y-%m-%d") - today_dt).days
-            if days < 7:  # mindestens 1 Woche
+            if days < 7:
                 continue
             diff = abs(days - target_dte)
             if diff < best_diff:
@@ -316,8 +310,8 @@ def get_tradier_options(symbol, direction, tradier_token,
         if not opts:
             return {}
 
-        opt_type  = "call" if direction == "CALL" else "put"
-        best      = None
+        opt_type        = "call" if direction == "CALL" else "put"
+        best            = None
         best_diff_delta = 999.0
         for opt in opts:
             if opt.get("option_type") != opt_type:
@@ -424,15 +418,11 @@ def calculate_score(price, change_pct, above_ma50, ma20,
 
 # ══════════════════════════════════════════════════════════
 # TICKER VERARBEITUNG
-# Fix Nr. 5: Liquiditäts-Malus nutzt RULES.max_spread_pct + RULES.min_open_interest
-# Fix Nr. 6: target_dte wird an get_tradier_options() übergeben
+# Fix: check_liquidity() als harter Filter
 # ══════════════════════════════════════════════════════════
 
 def process_ticker(ticker, direction, earnings_list, cfg,
                    target_dte: int = 21) -> dict:
-    """
-    Fix Nr. 6: target_dte Parameter — kommt aus parse_ticker_signals().
-    """
     is_etf      = ticker in ETF_TICKERS
     finnhub_key = cfg.get("finnhub_key", "")
     q_fut: Future = None
@@ -469,15 +459,17 @@ def process_ticker(ticker, direction, earnings_list, cfg,
                 "rel_vol": "n/v", "unusual": False, "ma50": None, "ma20": None,
                 "above_ma50": None, "new_20d_high": None, "trend_status": "n/v",
                 "bullish": 50.0, "sent_fallback": True, "earnings_soon": False,
+                "_liquidity_fail": False, "_liquidity_reason": "",
             }
 
-        bullish, bearish, buzz, sent_fallback = get_sentiment(ticker, change_pct, finnhub_key)
-        rel_vol    = calc_rel_volume(volumes)
-        unusual    = bool(rel_vol and rel_vol >= 1.5)
-        ma50       = calc_ma(closes, 50)
-        ma20       = calc_ma(closes, 20)
-        above_ma50 = (price > ma50) if (ma50 is not None and price > 0) else None
-        new_20d    = None
+        bullish, bearish, buzz, sent_fallback = get_sentiment(
+            ticker, change_pct, finnhub_key)
+        rel_vol       = calc_rel_volume(volumes)
+        unusual       = bool(rel_vol and rel_vol >= 1.5)
+        ma50          = calc_ma(closes, 50)
+        ma20          = calc_ma(closes, 20)
+        above_ma50    = (price > ma50) if (ma50 is not None and price > 0) else None
+        new_20d       = None
         if len(closes) >= 20 and price > 0:
             recent_high = max(closes[-20:])
             new_20d     = price >= recent_high * 0.98 if recent_high > 0 else None
@@ -487,7 +479,6 @@ def process_ticker(ticker, direction, earnings_list, cfg,
             price, change_pct, above_ma50, ma20, direction,
             bullish, unusual, earnings_soon, is_etf)
 
-        # Fix Nr. 6: target_dte an get_tradier_options übergeben
         options_data = get_tradier_options(
             ticker, direction,
             cfg.get("tradier_token", ""),
@@ -495,40 +486,41 @@ def process_ticker(ticker, direction, earnings_list, cfg,
             target_dte=target_dte,
         )
 
-        # Fix Nr. 5: Liquiditäts-Malus mit RULES-Konstanten (2% / 5000 OI)
-        if options_data and price > 0:
-            spread_pct = options_data.get("spread_pct") or 999
-            open_int   = options_data.get("open_interest") or 0
-            if spread_pct > RULES.max_spread_pct or open_int < RULES.min_open_interest:
-                score        = round(max(0.0, score - 40.0), 2)
-                score_reason = "liquidity_malus"
+        # Harter Liquiditäts-Filter — kein Malus mehr, sondern Ausschluss
+        is_liquid, liquidity_reason = check_liquidity(options_data)
+        if not is_liquid:
+            logger.info("%s: Liquiditäts-Filter: %s", ticker, liquidity_reason)
+            score        = 0.0
+            score_reason = "liquidity_fail"
 
-        logger.info("%s: price=%.2f score=%.1f src=%s dte=%d",
-                    ticker, price, score, quote_src, target_dte)
+        logger.info("%s: price=%.2f score=%.1f liquid=%s src=%s dte=%d",
+                    ticker, price, score, is_liquid, quote_src, target_dte)
 
         return {
-            "ticker":         ticker,
-            "price":          price,
-            "change_pct":     change_pct,
-            "rel_vol":        str(rel_vol) if rel_vol is not None else "n/v",
-            "unusual":        unusual,
-            "ma50":           ma50,
-            "ma20":           ma20,
-            "above_ma50":     above_ma50,
-            "new_20d_high":   new_20d,
-            "trend_status":   ("über MA50" if above_ma50 is True
-                               else ("unter MA50" if above_ma50 is False else "n/v")),
-            "bullish":        round(bullish, 1),
-            "sent_fallback":  sent_fallback,
-            "earnings_soon":  earnings_soon,
-            "score":          score,
-            "_score_reason":  score_reason,
-            "options":        options_data,
-            "news_direction": direction,
-            "is_etf":         is_etf,
-            "_src_quote":     quote_src,
-            "_src_hist":      hist_src,
-            "_closes_count":  len(closes),
+            "ticker":           ticker,
+            "price":            price,
+            "change_pct":       change_pct,
+            "rel_vol":          str(rel_vol) if rel_vol is not None else "n/v",
+            "unusual":          unusual,
+            "ma50":             ma50,
+            "ma20":             ma20,
+            "above_ma50":       above_ma50,
+            "new_20d_high":     new_20d,
+            "trend_status":     ("über MA50" if above_ma50 is True
+                                 else ("unter MA50" if above_ma50 is False else "n/v")),
+            "bullish":          round(bullish, 1),
+            "sent_fallback":    sent_fallback,
+            "earnings_soon":    earnings_soon,
+            "score":            score,
+            "_score_reason":    score_reason,
+            "_liquidity_fail":  not is_liquid,
+            "_liquidity_reason": liquidity_reason,
+            "options":          options_data,
+            "news_direction":   direction,
+            "is_etf":           is_etf,
+            "_src_quote":       quote_src,
+            "_src_hist":        hist_src,
+            "_closes_count":    len(closes),
         }
 
     except Exception as e:
@@ -543,6 +535,7 @@ def process_ticker(ticker, direction, earnings_list, cfg,
             "rel_vol": "n/v", "unusual": False, "ma50": None, "ma20": None,
             "above_ma50": None, "new_20d_high": None, "trend_status": "n/v",
             "bullish": 40.0, "sent_fallback": True, "earnings_soon": False,
+            "_liquidity_fail": True, "_liquidity_reason": "exception",
             "_error": str(e)[:120],
         }
 
@@ -551,16 +544,19 @@ def process_ticker(ticker, direction, earnings_list, cfg,
 # SUMMARY BUILDER
 # ══════════════════════════════════════════════════════════
 
-def build_summary(ranked, vix_value, ticker_directions, earnings_list,
-                  unusual_list, failed):
+def build_summary(ranked, vix_value, ticker_directions,
+                  earnings_list, unusual_list, failed):
     today    = datetime.now().strftime("%Y-%m-%d")
     srcs_str = ", ".join(d["ticker"] + "=" + d.get("_src_quote","?") for d in ranked)
 
     s  = "DATUM: " + today + "\n"
     s += "VIX: " + str(vix_value) + "\n"
-    s += "NEWS-SIGNALE: " + (", ".join(t + ":" + d for t, d in ticker_directions.items()) or "keine") + "\n"
-    s += "EARNINGS NAECHSTE 10 TAGE: " + (", ".join(earnings_list) if earnings_list else "Keine") + "\n"
-    s += "UNUSUAL ACTIVITY (RelVol >= 1.5x): " + (", ".join(unusual_list) or "Keiner") + "\n"
+    s += "NEWS-SIGNALE: " + (
+        ", ".join(t + ":" + d for t, d in ticker_directions.items()) or "keine") + "\n"
+    s += "EARNINGS NAECHSTE 10 TAGE: " + (
+        ", ".join(earnings_list) if earnings_list else "Keine") + "\n"
+    s += "UNUSUAL ACTIVITY (RelVol >= 1.5x): " + (
+        ", ".join(unusual_list) or "Keiner") + "\n"
     s += "TOP 3: " + ", ".join(d["ticker"] for d in ranked[:3]) + "\n"
     s += "QUOTE-QUELLEN: " + srcs_str + "\n"
     if failed:
@@ -576,15 +572,22 @@ def build_summary(ranked, vix_value, ticker_directions, earnings_list,
             s += (d["ticker"].ljust(6) + " | ETF-SIGNAL | Richtung: " +
                   d["news_direction"] + " | Score: 0\n")
             continue
+
         news_flag = ("📈" if d["news_direction"] == "CALL" else "📉") + d["news_direction"]
         kurs_str  = f"{d['price']:>7.2f}" if d["price"] > 0 else "   n/v!"
         high_str  = ("JA" if d.get("new_20d_high") is True
                      else ("nein" if d.get("new_20d_high") is False else "n/v"))
+        liq_flag  = " ⛔" if d.get("_liquidity_fail") else ""
+
         s += (f"{d['ticker']:<6} | {kurs_str} | {d['change_pct']:>6.2f}% | "
               f"{str(d.get('ma50','n/v')):>7} | {d.get('trend_status','n/v'):<14} | "
               f"{high_str:<5} | {str(d['rel_vol']):>6}{'🔥' if d.get('unusual') else ''} | "
-              f"{news_flag:>5} | {d['bullish']:>6.1f}% | {d['score']:>6.2f}\n")
-        if d.get("options"):
+              f"{news_flag:>5} | {d['bullish']:>6.1f}% | "
+              f"{d['score']:>6.2f}{liq_flag}\n")
+
+        if d.get("_liquidity_fail") and d.get("_liquidity_reason"):
+            s += "  ⛔ LIQUIDITÄT: " + d["_liquidity_reason"] + "\n"
+        elif d.get("options"):
             opt = d["options"]
             s += ("  └─ OPTIONS: Strike=" + str(opt.get("strike","n/v")) +
                   " | Exp=" + str(opt.get("expiration","n/v")) +
@@ -606,12 +609,15 @@ def build_summary(ranked, vix_value, ticker_directions, earnings_list,
 
 if __name__ == "__main__":
     import argparse
+    import re
     from config_loader import load_config, validate_config
+    from rules import parse_ticker_signals
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
 
     parser = argparse.ArgumentParser(description="Market Data Fetcher")
-    parser.add_argument("--signals",      help="Ticker-Signale z.B. 'UBER:CALL:MED:T1:21DTE'")
+    parser.add_argument("--signals",      help="Ticker-Signale")
     parser.add_argument("--signals-file", help="Datei mit Signalen")
     parser.add_argument("--output",       help="Market Summary speichern")
     args = parser.parse_args()
@@ -629,13 +635,10 @@ if __name__ == "__main__":
     else:
         raise SystemExit("--signals oder --signals-file erforderlich")
 
-    if "TICKER_SIGNALS:" in raw:
-        raw = raw[raw.index("TICKER_SIGNALS:") + len("TICKER_SIGNALS:"):]
-
-    from rules import parse_ticker_signals
-    parsed = parse_ticker_signals(raw)
+    parsed            = parse_ticker_signals(raw)
     ticker_directions = {s["ticker"]: s["direction"] for s in parsed}
-    tickers           = list(ticker_directions.keys())[:12]
+    dte_map           = {s["ticker"]: s["dte_days"]  for s in parsed}
+    tickers           = list(ticker_directions.keys())
 
     finnhub_key = cfg.get("finnhub_key", "")
     today       = datetime.now().strftime("%Y-%m-%d")
@@ -647,13 +650,10 @@ if __name__ == "__main__":
         vix_value     = vix_fut.result(timeout=12)
         earnings_list = earnings_fut.result(timeout=12)
 
-    # Fix Nr. 6: dte_days aus Signal übergeben
-    dte_map = {s["ticker"]: s["dte_days"] for s in parsed}
-
-    with ThreadPoolExecutor(max_workers=12) as ex:
+    with ThreadPoolExecutor(max_workers=RULES.max_tickers) as ex:
         futures = {
-            ex.submit(process_ticker, t, ticker_directions[t], earnings_list, cfg,
-                      dte_map.get(t, 21)): t
+            ex.submit(process_ticker, t, ticker_directions[t],
+                      earnings_list, cfg, dte_map.get(t, 21)): t
             for t in tickers
         }
         results = []
@@ -668,8 +668,8 @@ if __name__ == "__main__":
     unusual_list = [d["ticker"] for d in market_data if d.get("unusual")]
     failed       = [d["ticker"] for d in market_data if d.get("_src_quote") == "failed"]
 
-    summary = build_summary(ranked, vix_value, ticker_directions, earnings_list,
-                            unusual_list, failed)
+    summary = build_summary(ranked, vix_value, ticker_directions,
+                            earnings_list, unusual_list, failed)
     print(summary)
     if args.output:
         with open(args.output, "w") as f:
