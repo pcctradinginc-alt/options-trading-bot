@@ -1,9 +1,11 @@
 """
-main.py — Options Trading Bot
+main.py — Daily Options Report Pipeline
 
-Fixes v2:
-- VIX direkt an apply_vix_rules() übergeben (Fix Nr. 1+2)
-- DTE aus Signal an process_ticker() übergeben (Fix Nr. 6)
+v4 Änderungen:
+- SEC EDGAR Check nach Marktdaten-Verarbeitung
+- Fail-safe: SEC optional, bei Fehler ignoriert
+- transformers/torch Logging unterdrückt
+- Alle v3 Fixes: VIX direkt, DTE pro Ticker, etc.
 """
 
 import argparse
@@ -32,13 +34,15 @@ def setup_logging(verbose: bool) -> None:
     logging.basicConfig(level=level, format=fmt, datefmt=datefmt)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("requests").setLevel(logging.WARNING)
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+    logging.getLogger("torch").setLevel(logging.ERROR)
 
 
 logger = logging.getLogger(__name__)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Options Trading Bot")
+    parser = argparse.ArgumentParser(description="Daily Options Report")
     parser.add_argument("--dry-run", action="store_true",
                         help="Kein Email-Versand — Report als report_preview.html")
     parser.add_argument("--verbose", action="store_true",
@@ -76,8 +80,10 @@ def main() -> int:
 
     if args.verbose:
         for c in clusters[:5]:
-            logger.debug("  [%.2f] %-8s %s", c["confidence_score"],
-                         c["ticker"], c["headline_repr"][:55])
+            src = c.get("sentiment_source", "keyword")
+            logger.debug("  [%.2f] %-8s sent=%+.2f(%s) %s",
+                         c["confidence_score"], c["ticker"],
+                         c["sentiment_score"], src, c["headline_repr"][:45])
 
     ticker_signals = run_claude(
         cluster_text, market_time, market_status,
@@ -85,7 +91,7 @@ def main() -> int:
     )
     logger.info("  Signal: %s  (%.1fs)", ticker_signals, time.monotonic() - t1)
 
-    # Fix Nr. 1+2: VIX direkt holen — autoritativer Wert für apply_vix_rules()
+    # VIX direkt holen — autoritativer Wert
     vix_value = get_vix()
     logger.info("  VIX: %s", vix_value)
 
@@ -112,12 +118,10 @@ def main() -> int:
 
     ticker_directions = {s["ticker"]: s["direction"] for s in parsed_signals}
     tickers           = list(ticker_directions.keys())
-
-    # Fix Nr. 6: DTE-Map aus Signal — wird an process_ticker() übergeben
-    dte_map = {s["ticker"]: s["dte_days"] for s in parsed_signals}
+    dte_map           = {s["ticker"]: s["dte_days"] for s in parsed_signals}
 
     logger.info("  Geparste Ticker: %s", ", ".join(
-        t + ":" + d + "(" + str(dte_map.get(t,21)) + "DTE)"
+        t + ":" + d + "(" + str(dte_map.get(t, 21)) + "DTE)"
         for t, d in ticker_directions.items()
     ))
 
@@ -131,11 +135,10 @@ def main() -> int:
 
     logger.info("  VIX: %s | %d Ticker", vix_value, len(tickers))
 
-    # Fix Nr. 6: target_dte pro Ticker übergeben
-    with ThreadPoolExecutor(max_workers=12) as ex:
+    with ThreadPoolExecutor(max_workers=RULES.max_tickers) as ex:
         futures = {
-            ex.submit(process_ticker, t, ticker_directions[t], earnings_list, cfg,
-                      dte_map.get(t, 21)): t
+            ex.submit(process_ticker, t, ticker_directions[t],
+                      earnings_list, cfg, dte_map.get(t, 21)): t
             for t in tickers
         }
         results = []
@@ -145,7 +148,11 @@ def main() -> int:
             except Exception as e:
                 logger.error("Ticker-Future Fehler: %s", e)
 
-    market_data  = [r for r in results if r]
+    market_data = [r for r in results if r]
+
+    # ── SEC EDGAR Check ───────────────────────────────────
+    _run_sec_check(market_data)
+
     ranked       = sorted(market_data, key=lambda x: x["score"], reverse=True)
     unusual_list = [d["ticker"] for d in market_data if d.get("unusual")]
     failed       = [d["ticker"] for d in market_data if d.get("_src_quote") == "failed"]
@@ -166,13 +173,11 @@ def main() -> int:
     t3 = time.monotonic()
 
     try:
-        # Fix Nr. 1+2: vix_value direkt übergeben — nicht aus Claude-JSON lesen
         data        = call_claude(market_summary, cfg.get("anthropic_api_key",""),
                                   vix_direct=vix_value)
         html_report = build_html(data, today)
         no_trade    = data.get("no_trade", False)
         ticker      = data.get("ticker","")
-        direction   = ticker_directions.get(ticker, "CALL")
         subject     = (
             "⏸️ Daily Options Report – No Trade – " + today if no_trade
             else "📊 Daily Options Report – " + today + " · " + ticker
@@ -190,7 +195,61 @@ def main() -> int:
     return 0
 
 
-def _send_or_save(html, subject, cfg, dry_run):
+# ══════════════════════════════════════════════════════════
+# SEC EDGAR CHECK
+# ══════════════════════════════════════════════════════════
+
+def _run_sec_check(market_data: list) -> None:
+    """
+    SEC EDGAR Check für alle Einzeltitel.
+    Fail-safe: bei Fehler/fehlender Library ignoriert.
+    Modifiziert market_data in-place.
+    """
+    try:
+        from sec_check import get_sec_signal, ETF_TICKERS as SEC_ETF
+
+        for d in market_data:
+            ticker = d["ticker"]
+            if ticker in SEC_ETF:
+                d["sec_bullish"]    = False
+                d["sec_bearish"]    = False
+                d["sec_insider"]    = False
+                d["sec_reason"]     = "ETF — kein SEC-Check"
+                d["sec_confidence"] = 0.0
+                continue
+
+            sec = get_sec_signal(ticker, days_back=14)
+            d["sec_bullish"]    = sec.get("bullish", False)
+            d["sec_bearish"]    = sec.get("bearish", False)
+            d["sec_insider"]    = sec.get("insider_buy", False)
+            d["sec_reason"]     = sec.get("reason", "")
+            d["sec_confidence"] = sec.get("confidence", 0.0)
+
+            # SEC bearish → Score halbieren
+            if sec.get("bearish") and d["score"] > 0:
+                old_score  = d["score"]
+                d["score"] = round(d["score"] * 0.5, 2)
+                logger.info("SEC bearish %s: Score %.1f → %.1f | %s",
+                            ticker, old_score, d["score"], sec.get("reason",""))
+
+            # SEC Insider-Kauf → Score +10
+            if sec.get("insider_buy") and d["score"] > 0:
+                old_score  = d["score"]
+                d["score"] = round(min(100.0, d["score"] + 10.0), 2)
+                logger.info("SEC Insider-Kauf %s: Score %.1f → %.1f | %s",
+                            ticker, old_score, d["score"], sec.get("reason",""))
+
+    except ImportError:
+        logger.debug("sec_check nicht installiert — SEC übersprungen")
+    except Exception as e:
+        logger.warning("SEC-Check Pipeline-Fehler: %s", e)
+
+
+# ══════════════════════════════════════════════════════════
+# HILFSFUNKTIONEN
+# ══════════════════════════════════════════════════════════
+
+def _send_or_save(html: str, subject: str, cfg: dict, dry_run: bool) -> None:
     if dry_run:
         with open("report_preview.html", "w", encoding="utf-8") as f:
             f.write(html)
@@ -199,7 +258,8 @@ def _send_or_save(html, subject, cfg, dry_run):
         send_email(subject, html, cfg)
 
 
-def _no_trade_html(today, vix=None, market_status="", clusters=None):
+def _no_trade_html(today: str, vix=None, market_status: str = "",
+                   clusters: list = None) -> str:
     vix_str    = str(vix) if vix and vix != "n/v" else "n/v"
     status_str = market_status or "unbekannt"
     clusters   = clusters or []
@@ -210,12 +270,17 @@ def _no_trade_html(today, vix=None, market_status="", clusters=None):
         tick      = c.get("ticker", "?")
         head      = c.get("headline_repr", "")[:60]
         sent      = c.get("sentiment_score", 0)
+        src       = c.get("sentiment_source", "keyword")
         sent_icon = "📈" if sent > 0.1 else ("📉" if sent < -0.1 else "➖")
+        src_badge = "🤖" if src == "finbert" else "🔤"
         cluster_rows += (
             f'<tr>'
-            f'<td style="padding:6px 8px;font-size:12px;font-weight:600;color:#1d1d1f;">{tick}</td>'
-            f'<td style="padding:6px 8px;font-size:12px;color:#86868b;text-align:center;">{conf:.2f}</td>'
-            f'<td style="padding:6px 8px;font-size:12px;color:#86868b;text-align:center;">{sent_icon}</td>'
+            f'<td style="padding:6px 8px;font-size:12px;font-weight:600;'
+            f'color:#1d1d1f;">{tick}</td>'
+            f'<td style="padding:6px 8px;font-size:12px;color:#86868b;'
+            f'text-align:center;">{conf:.2f}</td>'
+            f'<td style="padding:6px 8px;font-size:12px;color:#86868b;'
+            f'text-align:center;">{sent_icon}{src_badge}</td>'
             f'<td style="padding:6px 8px;font-size:12px;color:#86868b;">{head}</td>'
             f'</tr>'
         )
@@ -229,11 +294,16 @@ def _no_trade_html(today, vix=None, market_status="", clusters=None):
             'Top Cluster heute</p>'
             '<table style="width:100%;border-collapse:collapse;">'
             '<tr style="border-bottom:2px solid #e5e5ea;">'
-            '<th style="padding:4px 8px;font-size:10px;color:#86868b;text-align:left;">Ticker</th>'
+            '<th style="padding:4px 8px;font-size:10px;color:#86868b;'
+            'text-align:left;">Ticker</th>'
             '<th style="padding:4px 8px;font-size:10px;color:#86868b;">Conf</th>'
             '<th style="padding:4px 8px;font-size:10px;color:#86868b;">Sent</th>'
-            '<th style="padding:4px 8px;font-size:10px;color:#86868b;text-align:left;">Headline</th>'
-            '</tr>' + cluster_rows + '</table></div>'
+            '<th style="padding:4px 8px;font-size:10px;color:#86868b;'
+            'text-align:left;">Headline</th>'
+            '</tr>' + cluster_rows + '</table>'
+            '<p style="font-size:10px;color:#86868b;margin:6px 0 0 0;">'
+            '🤖 = finBERT &nbsp; 🔤 = Keyword</p>'
+            '</div>'
         )
 
     return (
@@ -279,7 +349,7 @@ def _no_trade_html(today, vix=None, market_status="", clusters=None):
     )
 
 
-def _error_html(error, today):
+def _error_html(error: str, today: str) -> str:
     return (
         '<html><head><meta charset="UTF-8"></head>'
         '<body style="font-family:-apple-system,sans-serif;background:#f5f5f7;'
@@ -287,7 +357,8 @@ def _error_html(error, today):
         '<div style="background:white;border-radius:18px;padding:32px;'
         'max-width:400px;margin:0 auto;">'
         '<div style="font-size:40px;margin-bottom:16px;">⚠️</div>'
-        '<h2 style="color:#1d1d1f;margin:0 0 8px 0;">Daily Options Report — Fehler</h2>'
+        '<h2 style="color:#1d1d1f;margin:0 0 8px 0;">'
+        'Daily Options Report — Fehler</h2>'
         f'<p style="color:#86868b;font-size:14px;">{error}</p>'
         '</div></body></html>'
     )
