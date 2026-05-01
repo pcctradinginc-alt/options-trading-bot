@@ -48,8 +48,10 @@ def _json(obj: Any) -> str:
 
 def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(db_path)
+    con = sqlite3.connect(db_path, timeout=10)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=5000")
     init_db(con)
     return con
 
@@ -97,6 +99,17 @@ def init_db(con: sqlite3.Connection) -> None:
             ev_pct REAL,
             ev_dollars REAL,
             conservative_entry REAL,
+            data_quality_ok INTEGER,
+            data_quality_reason TEXT,
+            no_trade_reason TEXT,
+            quote_source TEXT,
+            option_source TEXT,
+            realized_vol_20d REAL,
+            option_iv REAL,
+            iv_to_rv REAL,
+            exit_slippage_points REAL,
+            earnings_iv_ok INTEGER,
+            earnings_iv_reason TEXT,
             selected_trade INTEGER DEFAULT 0,
             FOREIGN KEY(run_id) REFERENCES runs(run_id)
         );
@@ -120,7 +133,27 @@ def init_db(con: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_outcomes_due ON outcomes(status, due_at);
         """
     )
+    _ensure_columns(con, "signals", {
+        "data_quality_ok": "INTEGER",
+        "data_quality_reason": "TEXT",
+        "no_trade_reason": "TEXT",
+        "quote_source": "TEXT",
+        "option_source": "TEXT",
+        "realized_vol_20d": "REAL",
+        "option_iv": "REAL",
+        "iv_to_rv": "REAL",
+        "exit_slippage_points": "REAL",
+        "earnings_iv_ok": "INTEGER",
+        "earnings_iv_reason": "TEXT",
+    })
     con.commit()
+
+
+def _ensure_columns(con: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = {row[1] for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, ddl in columns.items():
+        if name not in existing:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
 def create_run(market_status: str = "", vix: Any = None, raw_ticker_signals: str = "",
@@ -202,8 +235,10 @@ def log_market_signals(run_id: int, parsed_signals: list[dict], market_data: lis
                 run_id, created_at, ticker, direction, signal_strength, horizon, dte_days,
                 cluster_json, market_json, option_json, sec_json, price, change_pct, rel_vol,
                 score, score_reason, liquidity_fail, liquidity_reason, ev_ok, ev_pct,
-                ev_dollars, conservative_entry
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ev_dollars, conservative_entry, data_quality_ok, data_quality_reason,
+                no_trade_reason, quote_source, option_source, realized_vol_20d, option_iv,
+                iv_to_rv, exit_slippage_points, earnings_iv_ok, earnings_iv_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id, iso(created), ticker, d.get("news_direction") or ps.get("direction"),
@@ -213,6 +248,11 @@ def log_market_signals(run_id: int, parsed_signals: list[dict], market_data: lis
                 d.get("_score_reason"), 1 if d.get("_liquidity_fail") else 0,
                 d.get("_liquidity_reason", ""), 1 if opt.get("ev_ok") else 0,
                 opt.get("ev_pct"), opt.get("ev_dollars"), opt.get("conservative_entry"),
+                1 if d.get("_data_quality_ok") else 0, d.get("_data_quality_reason", ""),
+                d.get("_no_trade_reason", ""), d.get("_src_quote", ""), opt.get("option_source", ""),
+                d.get("realized_vol_20d"), opt.get("iv_decimal"), opt.get("iv_to_rv"),
+                opt.get("exit_slippage_points"), 1 if opt.get("earnings_iv_ok", True) else 0,
+                opt.get("earnings_iv_reason", ""),
             ),
         )
         signal_id = int(cur.lastrowid)
