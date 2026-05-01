@@ -19,6 +19,8 @@ from requests.exceptions import RequestException, Timeout
 
 from market_calendar import market_context
 from news_utils import article_fingerprint, canonicalize_url, near_duplicate_key
+from rules import RULES
+from llm_schema import validate_ticker_signal_line
 
 logger = logging.getLogger(__name__)
 
@@ -918,14 +920,23 @@ def _rule_based_signal_fallback(cluster_text: str) -> str:
     return line
 
 
+
+def _validate_signal_line_or_none(line: str, source: str) -> str | None:
+    canonical, errors = validate_ticker_signal_line(line, max_tickers=RULES.max_tickers)
+    if canonical:
+        return canonical
+    logger.warning("%s Signal-Schema-Guard blockiert Output: %s", source, "; ".join(errors[:3]))
+    return None
+
 def run_claude(cluster_text: str, market_time: str, market_status: str,
                api_key: str, max_retries: int = 2) -> str:
     prompt = PROMPT.replace("{market_time}", market_time).replace(
         "{market_status}", market_status)
 
     if not api_key:
-        logger.warning("ANTHROPIC_API_KEY fehlt — nutze deterministischen Fallback")
-        return _rule_based_signal_fallback(cluster_text)
+        logger.warning("ANTHROPIC_API_KEY fehlt — nutze deterministischen Fallback mit Schema-Guard")
+        fallback = _rule_based_signal_fallback(cluster_text)
+        return _validate_signal_line_or_none(fallback, "Fallback") or "TICKER_SIGNALS:NONE"
 
     last_raw = ""
     for attempt in range(max_retries):
@@ -955,18 +966,26 @@ def run_claude(cluster_text: str, market_time: str, market_status: str,
             last_raw = raw
             line = _canonical_signal_line(raw)
             if line:
-                logger.info("Claude Signal: %s", line)
-                return line
+                guarded = _validate_signal_line_or_none(line, "Claude")
+                if guarded:
+                    logger.info("Claude Signal: %s", guarded)
+                    return guarded
+                last_raw = raw
+                continue
             logger.warning("Claude-Ausgabe nicht parsebar: %s", raw[:500])
         except (RequestException, Timeout) as e:
             logger.warning("Claude-Call Versuch %d: %s", attempt + 1, e)
         except (KeyError, ValueError, TypeError) as e:
             logger.warning("Claude-Response Parse-Fehler: %s", e)
 
-    logger.warning("Keine validen Claude-Signale nach %d Versuchen — nutze Fallback", max_retries)
+    logger.warning("Keine schema-validen Claude-Signale nach %d Versuchen", max_retries)
     if last_raw:
         logger.debug("Letzte Claude-Rohantwort: %s", last_raw[:1000])
-    return _rule_based_signal_fallback(cluster_text)
+    if RULES.llm_fail_closed:
+        logger.warning("LLM-Schema-Guard: fail-closed — kein Trade aus unvalidiertem Output")
+        return "TICKER_SIGNALS:NONE"
+    fallback = _rule_based_signal_fallback(cluster_text)
+    return _validate_signal_line_or_none(fallback, "Fallback") or "TICKER_SIGNALS:NONE"
 
 
 # ══════════════════════════════════════════════════════════
