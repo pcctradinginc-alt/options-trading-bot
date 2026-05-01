@@ -32,24 +32,26 @@ HARTE REGELN:
 - VIX >= 25 -> no_trade: true, no_trade_grund: maximal 12 Woerter ohne Satzzeichen
 - VIX 20-24.99 -> einsatz: 150
 - VIX < 20 -> einsatz: 250
-- Waehle NIEMALS einen Ticker mit Score < 50
+- Waehle NIEMALS einen Ticker mit Score < 65 fuer echten Trade. Score 50-64 ist nur Research.
 - Waehle NIEMALS einen Ticker mit Gate=FAIL, DATA_QUALITY_OK=False, SECTOR_MARKET_OK=False, EV_OK=False, EARN_IV_OK=False oder Liquiditaets-Hinweis
 - Nutze conservative_entry/Entry als Einstiegspreis, NICHT blind Midpoint
 - kontrakte = floor(einsatz / (entry_price * 100))
 - stop_loss_eur = 30% von einsatz
 - bid/ask/midpoint/entry/ev aus Marktdaten uebernehmen, nicht schaetzen
 - Sentiment darf NIEMALS einen schlechten EV, schlechte Liquiditaet oder Earnings-IV-Block ueberschreiben
+- Du siehst absichtlich KEINE News-Texte. Entscheide nur anhand nackter Marktdaten, Gates, Greeks, Preis, Liquiditaet, IV/RV und Sektor.
 
 DATENQUALITAET:
 - Tradier Production ist Standard. Sandbox/Delayed-Daten nur als Dry-run-Kontext betrachten.
-- Tradier-Optionsdaten mit nicht-Tradier-Underlying sind kein Trade.
+- Tradier-Optionsdaten mit nicht-Tradier-Underlying sind immer no_trade true. Kein Yahoo/AlphaVantage-Fallback fuer finalen EV.
 - Wenn Quote-Quelle oder Optionsdaten inkonsistent sind: no_trade true.
 - Wenn DATA_FLAGS auf kaputte Historie, Spike ohne News oder fehlende Basisdaten hinweisen: no_trade true.
 - Wenn No-Trade-Reason im Marktdatenblock steht, diese Begruendung uebernehmen.
 
 MARKT-/SEKTORFILTER:
-- CALL gegen schwachen SPY/QQQ/Sektor ohne relative Staerke ist kein Trade.
-- PUT gegen starken SPY/QQQ/Sektor ohne relative Schwaeche ist kein Trade.
+- CALL braucht idealerweise Aktie > Sektor und Sektor > SPY/QQQ.
+- PUT braucht idealerweise Aktie < Sektor und Sektor < SPY/QQQ.
+- Gegen klaren Sektor-/Markttrend: no_trade oder Research-Only, nicht schoenrechnen.
 - Relative Staerke/Schwaeche darf den Score verbessern, aber nie EV/Liquiditaet/Datenqualitaet ueberschreiben.
 
 SENTIMENT/PREISREAKTION:
@@ -67,11 +69,12 @@ OPTIONS-EV UND KOSTEN:
 - Bevorzuge hoechstes EV%, positives EV$, hohe FillP, niedrigen Spread, ausreichendes OI
 - ExitSlip ist realer Kostenblock und muss im Risiko genannt werden
 - Kein Trade wenn erwarteter Move Entry+Exit-Slippage+Theta+IV-Risiko nicht klar schlaegt
-- Chance/Risiko muss Entry, Break-even-Move, EV%, EV$, FillP, ExitSlip, IV/RV und falls vorhanden IVRank nennen
+- Chance/Risiko muss Entry, Break-even-Move, EV%, EV$, FillP, ExitSlip, IV/RV, IVRank und TimeStop nennen
 
 EARNINGS / IV-CRUSH:
 - EARN_IV_OK=False ist harter Ausschluss fuer Long-Optionen
 - IVRank/IVPct aus eigener Journal-Historie: bei hohem Rank/Percentile ist Long-Option zu teuer
+- Cold Start: Wenn IV-Historie zu kurz ist und IV/RV >= 1.50, ist Long-Option no_trade wegen Overpricing
 - Wenn Earnings nahe und IV/RV unbekannt oder zu hoch: no_trade true
 - Earnings nicht nur als Score-Malus behandeln, sondern als Trade-Gate
 
@@ -86,6 +89,12 @@ BEGRUENDUNG (begruendung_detail - 5 Felder, je max 2 Saetze, keine Anfuehrungsze
 - chance_risiko: Einsatz, Entry, Break-even, Ziel, Stop.
 - risiko: Hauptrisiko inklusive Spread, Slippage, Datenqualitaet, Earnings/IV.
 
+TIME-STOP:
+- Bei 7-14 DTE: nach 24h pruefen.
+- Bei 15-30 DTE: nach 48h pruefen.
+- Bei >30 DTE: nach 72h pruefen.
+- Wenn Underlying dann nicht mindestens 1% in Zielrichtung gelaufen ist: Exit/Close pruefen.
+
 MARKTSTATUS: markt-Feld 2-3 Saetze. strategie-Feld 1 Satz.
 TICKER_TABELLE: ALLE Ticker aus Marktdaten eintragen.
 Regime NUR: LOW-VOL, TRENDING oder HIGH-VOL
@@ -94,7 +103,7 @@ regime_farbe NUR: gruen, gelb oder rot
 Gib direction exakt aus den Marktdaten zurueck: CALL oder PUT.
 
 JSON-Schema:
-{"datum":"DD.MM.YYYY","vix":"WERT","regime":"TRENDING","regime_farbe":"gelb","no_trade":false,"no_trade_grund":"","vix_warnung":false,"direction":"CALL","ticker":"SYMBOL","strike":"WERT","laufzeit":"DATUM","delta":"WERT","iv":"WERT%","iv_to_rv":"WERT","bid":"WERT","ask":"WERT","midpoint":"WERT","conservative_entry":"WERT","entry_price":"WERT","exit_slippage_points":"WERT","fill_probability":"WERT","ev_pct":"WERT","ev_dollars":"WERT","breakeven_move_pct":"WERT","kontrakte":"N","einsatz":150,"stop_loss_eur":45,"unusual":false,"begruendung_detail":{"ticker_wahl":"...","option_wahl":"...","timing":"...","chance_risiko":"...","risiko":"..."},"markt":"...","strategie":"...","ausgeschlossen":"TICKER: GRUND","ticker_tabelle":[{"ticker":"USO","direction":"CALL","kurs":"120.89","chg":"+2.11%","ma50":"84.88","trend":"ueber MA50","sector":"XLE","rel_sector":"+0.85","sentpx":"bearish_news_absorbed","relvol":"1.99","bull":"61.3%","score":"86.65","ev_ok":true,"ev_pct":"18.4","gewinner":true,"ausgeschlossen":false,"no_trade_reason":""}]}
+{"datum":"DD.MM.YYYY","vix":"WERT","regime":"TRENDING","regime_farbe":"gelb","no_trade":false,"no_trade_grund":"","vix_warnung":false,"direction":"CALL","ticker":"SYMBOL","strike":"WERT","laufzeit":"DATUM","delta":"WERT","iv":"WERT%","iv_to_rv":"WERT","bid":"WERT","ask":"WERT","midpoint":"WERT","conservative_entry":"WERT","entry_price":"WERT","exit_slippage_points":"WERT","fill_probability":"WERT","ev_pct":"WERT","ev_dollars":"WERT","breakeven_move_pct":"WERT","time_stop":"Nach 48h +1% sonst Exit pruefen","kontrakte":"N","einsatz":150,"stop_loss_eur":45,"unusual":false,"begruendung_detail":{"ticker_wahl":"...","option_wahl":"...","timing":"...","chance_risiko":"...","risiko":"..."},"markt":"...","strategie":"...","ausgeschlossen":"TICKER: GRUND","ticker_tabelle":[{"ticker":"USO","direction":"CALL","kurs":"120.89","chg":"+2.11%","ma50":"84.88","trend":"ueber MA50","sector":"XLE","rel_sector":"+0.85","sentpx":"bearish_news_absorbed","relvol":"1.99","bull":"61.3%","score":"86.65","ev_ok":true,"ev_pct":"18.4","gewinner":true,"ausgeschlossen":false,"no_trade_reason":""}]}
 """
 
 
@@ -329,6 +338,7 @@ def build_html(d: dict, today: str) -> str:
             row("Fill-Wahrscheinlichkeit", d.get("fill_probability","n/v")) +
             row("Options-EV",          str(d.get("ev_pct","n/v")) + "% / " + str(d.get("ev_dollars","n/v")) + "$") +
             row("Break-even Move",     str(d.get("breakeven_move_pct","n/v")) + "%") +
+            row("Time-Stop",           d.get("time_stop", d.get("time_stop_rule", "48h: +1% Zielrichtung sonst Exit prüfen"))) +
             row("Kontrakte",           str(d.get("kontrakte","n/v"))) +
             row("Einsatz",             str(einsatz) + "€") +
             row("Stop-Loss",           "–30% = max. " + str(stop_loss) + "€", R) +
@@ -398,12 +408,12 @@ def build_html(d: dict, today: str) -> str:
             tp2_usd    = round(tp1_usd * 0.90, 2)
             cost_total = round(mid_f * 100 * kontr, 2)
             cost_str   = f"Einstieg: {mid_f:.2f} USD × {kontr} Kontrakt(e) = {cost_total:.2f} USD"
-            stop_str   = f"–40% → {stop_usd:.2f} USD (max. {stop_e}€ Verlust)"
+            stop_str   = f"–30% → {stop_usd:.2f} USD (max. {stop_e}€ Verlust)"
             tp1_str    = f"+50% → {tp1_usd:.2f} USD | 50% schließen"
             tp2_str    = f"Rest mit –10% Stop → {tp2_usd:.2f} USD"
         else:
             cost_str = "Einstieg: n/v"
-            stop_str = f"–40% = max. {stop_e}€"
+            stop_str = f"–30% = max. {stop_e}€"
             tp1_str  = "+50% → 50% schließen"
             tp2_str  = "Rest mit –10% Stop"
 
@@ -412,7 +422,7 @@ def build_html(d: dict, today: str) -> str:
                          row("Stop-Loss",       stop_str, R) +
                          row("Take-Profit 1",   tp1_str, G) +
                          row("Take-Profit 2",   tp2_str, G) +
-                         row("Zeit-Exit",       "<10 Tage bis Verfall → schließen") +
+                         row("Zeit-Exit",       d.get("time_stop", d.get("time_stop_rule", "48h ohne +1% Zielbewegung → Exit prüfen"))) +
                          row("Delta Rebalance", "Delta > ±0.30 → prüfen") +
                          row("Vega Exit",       "IV +20% → 50% schließen", last=True))
 
