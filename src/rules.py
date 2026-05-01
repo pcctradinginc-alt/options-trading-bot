@@ -1,7 +1,7 @@
 """
 rules.py — Zentrale Trading-Regeln
 
-v7 Rational-Gates:
+v9 Rational-Gates:
 - EV nur mit konsistentem Snapshot sinnvoll: Tradier-Optionen brauchen bevorzugt Tradier-Underlying.
 - Realistisches Kostenmodell: Entry-Slippage + härtere Exit-Slippage.
 - Earnings/IV-Crush-Schutz: Long-Optionen bei nahen Earnings und hoher/unklarer IV blockieren.
@@ -68,6 +68,21 @@ class TradingRules:
     valid_scores: tuple = ("HIGH", "MED", "LOW")
     valid_horizons: tuple = ("T1", "T2", "T3")
     max_tickers: int = 5
+    min_dte_days: int = 7
+    max_dte_days: int = 120
+
+    # LLM-Schema-Guard
+    # Ungueltiger LLM-Output darf keinen Trade erzeugen.
+    llm_fail_closed: bool = True
+
+    # Eigener IV-Verlauf aus dem Journal. Kein Pseudo-IV-Rank aus Underlying/Yahoo.
+    min_iv_history_samples_for_rank: int = 30
+    iv_rank_hard_block_long: float = 80.0
+    iv_percentile_hard_block_long: float = 90.0
+    iv_rank_prefer_long_below: float = 35.0
+
+    # Daily-RVOL bleibt nur Diagnose, bis echte Minute-of-day-Historie aufgebaut ist.
+    daily_rvol_unusual_threshold: float = 1.5
 
 
 RULES = TradingRules()
@@ -408,7 +423,7 @@ def parse_ticker_signals(raw: str) -> list:
         except ValueError:
             continue
 
-        if dte_days < 7 or dte_days > 120:
+        if dte_days < RULES.min_dte_days or dte_days > RULES.max_dte_days:
             continue
 
         results.append({
