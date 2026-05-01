@@ -27,24 +27,38 @@ logger = logging.getLogger(__name__)
 
 PROMPT = """Du bist eine regelbasierte Options-KI. Antworte NUR mit JSON - kein Text, kein Markdown.
 
-REGELN:
+HARTE REGELN:
 - VIX >= 25 -> no_trade: true, no_trade_grund: maximal 8 Woerter ohne Satzzeichen
 - VIX 20-24.99 -> einsatz: 150
 - VIX < 20 -> einsatz: 250
-- Ausschluss: Score <50 | change_pct <0 | unter MA50 | Spread >2% | OI <5000
+- Waehle NIEMALS einen Ticker mit Score < 50
+- Waehle NIEMALS einen Ticker mit EV_OK=False, fehlendem Bid/Ask, fehlendem Entry oder Liquiditaets-Hinweis
+- Nutze conservative_entry/Entry als Einstiegspreis, NICHT blind Midpoint
+- kontrakte = floor(einsatz / (entry_price * 100))
 - stop_loss_eur = 30% von einsatz
-- kontrakte = round(einsatz / (midpoint * 100)) wenn midpoint bekannt
-- bid/ask aus Marktdaten uebernehmen
+- bid/ask/midpoint/entry/ev aus Marktdaten uebernehmen, nicht schaetzen
 
-ETF-SONDERREGEL (wenn ETF-SIGNAL in Marktdaten):
-- Empfehlung trotzdem ausgeben wenn VIX + Richtung klar
-- strike/delta/iv/bid/ask: n/v, kontrakte: n/v (manuell pruefen)
+RICHTUNGSLOGIK:
+- CALL darf positiv laufen: change_pct > 0 und ueber MA50 ist gut
+- CALL ist schwach bei change_pct < 0 oder unter MA50
+- PUT darf negativ laufen: change_pct < 0 und unter MA50 ist gut
+- PUT ist schwach bei change_pct > 0 oder ueber MA50
+- Also: change_pct < 0 oder unter MA50 ist KEIN Ausschluss fuer PUT
+
+OPTIONS-EV UND KOSTEN:
+- Bevorzuge hoechstes EV%, positives EV$, hohe FillP, niedrigen Spread, ausreichendes OI
+- Kein Trade wenn erwarteter Move die Kosten/Slippage/Theta nicht klar schlaegt
+- Chance/Risiko muss Entry, Break-even-Move, EV%, EV$ und FillP nennen
+
+ETF-SONDERREGEL:
+- ETF nur ausgeben, wenn Optionsdaten und EV_OK vorhanden sind
+- Wenn keine Optionsdaten: no_trade true
 
 BEGRUENDUNG (begruendung_detail - 5 Felder, je max 2 Saetze, keine Anfuehrungszeichen):
-- ticker_wahl: Warum dieser Ticker? Score-Vergleich.
-- option_wahl: Strike, Delta, IV, Spread.
-- timing: MA50-Abstand, RelVol, Trend.
-- chance_risiko: Einsatz, Ziel, Stop, Break-Even.
+- ticker_wahl: Warum dieser Ticker? Score- und EV-Vergleich.
+- option_wahl: Strike, Delta, IV, Spread, Entry, EV.
+- timing: Richtungsspezifisch: CALL vs PUT, MA50, RelVol, Trend.
+- chance_risiko: Einsatz, Entry, Break-even, Ziel, Stop.
 - risiko: Hauptrisiko und Fazit.
 
 MARKTSTATUS: markt-Feld 2-3 Saetze. strategie-Feld 1 Satz.
@@ -52,10 +66,10 @@ TICKER_TABELLE: ALLE Ticker aus Marktdaten eintragen.
 Regime NUR: LOW-VOL, TRENDING oder HIGH-VOL
 regime_farbe NUR: gruen, gelb oder rot
 
-Gib auch das Feld direction zurueck: CALL oder PUT (aus den Marktdaten uebernehmen).
+Gib direction exakt aus den Marktdaten zurueck: CALL oder PUT.
 
-JSON-Schema (valides JSON, kein Text davor/danach):
-{"datum":"DD.MM.YYYY","vix":"WERT","regime":"TRENDING","regime_farbe":"gelb","no_trade":false,"no_trade_grund":"","vix_warnung":false,"direction":"CALL","ticker":"SYMBOL","strike":"WERT","laufzeit":"DATUM","delta":"WERT","iv":"WERT%","bid":"WERT","ask":"WERT","midpoint":"WERT","kontrakte":"N","einsatz":150,"stop_loss_eur":60,"unusual":false,"begruendung_detail":{"ticker_wahl":"...","option_wahl":"...","timing":"...","chance_risiko":"...","risiko":"..."},"markt":"...","strategie":"...","ausgeschlossen":"TICKER: GRUND","ticker_tabelle":[{"ticker":"USO","kurs":"120.89","chg":"+2.11%","ma50":"84.88","trend":"ueber MA50","relvol":"1.99","bull":"61.3%","score":"86.65","gewinner":true,"ausgeschlossen":false}]}"""
+JSON-Schema:
+{"datum":"DD.MM.YYYY","vix":"WERT","regime":"TRENDING","regime_farbe":"gelb","no_trade":false,"no_trade_grund":"","vix_warnung":false,"direction":"CALL","ticker":"SYMBOL","strike":"WERT","laufzeit":"DATUM","delta":"WERT","iv":"WERT%","bid":"WERT","ask":"WERT","midpoint":"WERT","conservative_entry":"WERT","entry_price":"WERT","fill_probability":"WERT","ev_pct":"WERT","ev_dollars":"WERT","breakeven_move_pct":"WERT","kontrakte":"N","einsatz":150,"stop_loss_eur":45,"unusual":false,"begruendung_detail":{"ticker_wahl":"...","option_wahl":"...","timing":"...","chance_risiko":"...","risiko":"..."},"markt":"...","strategie":"...","ausgeschlossen":"TICKER: GRUND","ticker_tabelle":[{"ticker":"USO","direction":"CALL","kurs":"120.89","chg":"+2.11%","ma50":"84.88","trend":"ueber MA50","relvol":"1.99","bull":"61.3%","score":"86.65","ev_ok":true,"ev_pct":"18.4","gewinner":true,"ausgeschlossen":false}]}"""
 
 
 # ══════════════════════════════════════════════════════════
@@ -143,7 +157,7 @@ def _compress_summary(summary: str) -> str:
         result.append(line)
         if "SENTIMENT-FALLBACK" in line:
             break
-    return "\n".join(result)[:2000]
+    return "\n".join(result)[:4000]
 
 
 # ══════════════════════════════════════════════════════════
@@ -281,7 +295,11 @@ def build_html(d: dict, today: str) -> str:
             row("Delta",               d.get("delta","n/v")) +
             row("IV",                  d.get("iv","n/v")) +
             row("Bid / Ask",           str(d.get("bid","n/v")) + " / " + str(d.get("ask","n/v"))) +
-            row("Einstieg (Midpoint)", d.get("midpoint","n/v")) +
+            row("Midpoint",             d.get("midpoint","n/v")) +
+            row("Einstieg konservativ", d.get("entry_price", d.get("conservative_entry","n/v"))) +
+            row("Fill-Wahrscheinlichkeit", d.get("fill_probability","n/v")) +
+            row("Options-EV",          str(d.get("ev_pct","n/v")) + "% / " + str(d.get("ev_dollars","n/v")) + "$") +
+            row("Break-even Move",     str(d.get("breakeven_move_pct","n/v")) + "%") +
             row("Kontrakte",           str(d.get("kontrakte","n/v"))) +
             row("Einsatz",             str(einsatz) + "€") +
             row("Stop-Loss",           "–30% = max. " + str(stop_loss) + "€", R) +
