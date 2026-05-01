@@ -1,20 +1,10 @@
 """
 news_analyzer.py — News-Analyse (Step 1)
 
-Änderungen v3:
-- WSJ Feed (Tier 1, Credibility 0.89) hinzugefügt
-- Nasdaq Feed (Tier 2, Credibility 0.75) hinzugefügt
-- BBC_Business + BBC_Economy (Tier 2) hinzugefügt
-- Benzinga_Breaking Credibility 0.51 → 0.45
-- DECAY_LAMBDA 0.15 → 0.18 (schnelleres Altern)
-- VELOCITY_WINDOW_MIN 60 → 45 min
-- KEYWORDS erweitert: ai/tariff/fomc/rate cut/rate hike/rally/surge/default
-- KNOWN_TICKERS erweitert: PLTR/ARM/CRWD/MRVL/SMCI
-- TICKER_ALIASES erweitert
-- MACRO_TICKER_MAP erweitert: middle east/china/trade war
-- SENTIMENT erweitert
-- Confidence-Formel: Sentiment-Gewichtung (±30%)
-- Min. 3 Cluster vor Claude-Call
+v4 Änderungen:
+- finBERT Integration für Top-Cluster (Confidence > 2.0)
+- Fail-safe: finBERT optional, fällt auf Keyword-Sentiment zurück
+- Alle v3 Änderungen enthalten: BBC, WSJ, Nasdaq, DECAY 0.18, etc.
 """
 
 import hashlib
@@ -29,6 +19,19 @@ import requests
 from requests.exceptions import RequestException, Timeout
 
 logger = logging.getLogger(__name__)
+
+# Optionale finBERT Integration — Fail-safe
+try:
+    from finbert_sentiment import get_finbert_sentiment_batch, FINBERT_AVAILABLE
+except ImportError:
+    FINBERT_AVAILABLE = False
+    def get_finbert_sentiment_batch(texts):
+        return [0.0] * len(texts)
+
+
+# ══════════════════════════════════════════════════════════
+# PARAMETER
+# ══════════════════════════════════════════════════════════
 
 DECAY_LAMBDA            = 0.18
 VELOCITY_WINDOW_MIN     = 45
@@ -116,13 +119,10 @@ TICKER_ALIASES = {
     "Boeing": "BA", "Disney": "DIS", "Walmart": "WMT",
     "Uber": "UBER", "Airbnb": "ABNB",
     "Coinbase": "COIN", "FedEx": "FDX", "Eli Lilly": "LLY",
-    "Palantir": "PLTR",
-    "CrowdStrike": "CRWD",
-    "Marvell": "MRVL",
-    "Intel": "INTC",
+    "Palantir": "PLTR", "CrowdStrike": "CRWD",
+    "Marvell": "MRVL", "Intel": "INTC",
     "Super Micro": "SMCI", "Supermicro": "SMCI",
-    "Broadcom": "AVGO",
-    "ARM Holdings": "ARM",
+    "Broadcom": "AVGO", "ARM Holdings": "ARM",
 }
 
 MACRO_TICKER_MAP = {
@@ -134,9 +134,7 @@ MACRO_TICKER_MAP = {
     "recession": "SPY",
     "iran": "USO", "war": "GLD", "sanctions": "GLD",
     "hormuz": "USO", "strait": "USO", "shipper": "USO", "shipping": "USO",
-    "middle east": "USO",
-    "china": "SPY",
-    "trade war": "SPY",
+    "middle east": "USO", "china": "SPY", "trade war": "SPY",
 }
 
 TICKER_PATTERN = re.compile(r'\b([A-Z]{2,5})\b')
@@ -154,10 +152,8 @@ SENTIMENT_NEGATIVE = {
     "downgrade": 0.9, "downgraded": 0.9, "underperform": 0.7, "sell": 0.7,
     "cut": 0.6, "layoffs": 0.7, "bankruptcy": 1.0, "recall": 0.7,
     "investigation": 0.7, "warning": 0.7, "guidance cut": 0.9, "recession": 0.8,
-    "plunge": 0.85, "collapse": 0.85,
-    "default": 1.0, "insolvency": 1.0,
-    "crisis": 0.85,
-    "tariff": 0.7, "trade war": 0.75,
+    "plunge": 0.85, "collapse": 0.85, "default": 1.0, "insolvency": 1.0,
+    "crisis": 0.85, "tariff": 0.7, "trade war": 0.75,
 }
 
 PROMPT = """Du bist ein quantitativer Options-Analyst. Analysiere News-Cluster und gib direkt handelbare Signale aus.
@@ -170,7 +166,7 @@ SCORE-FELDER:
 - DECAY: Frische (1.0=frisch | 0.5=3.9h alt | <0.1=veraltet)
 - VELOCITY_MULT: >1.0 = Breaking-Signal (Fenster: 45 Minuten)
 - EARNINGS_PENALTY: <0.5 = Earnings innerhalb 7 Tage
-- SENTIMENT: positiv erhoeht Confidence bis +30%, negativ senkt bis -30%
+- SENTIMENT: finBERT oder Keyword-Score — positiv erhoeht Confidence bis +30%
 
 FILTER (verwirf sofort):
 - DECAY < 0.05 oder CONFIDENCE < 1.0
@@ -202,14 +198,19 @@ Format: TICKER_SIGNALS:TICKER:RICHTUNG:SCORE:HORIZONT:DTE,...
 Beispiel: TICKER_SIGNALS:USO:CALL:HIGH:T3:45DTE,PLTR:CALL:MED:T1:21DTE
 
 Regeln:
-- Max 8 Ticker | Sortiert HIGH->MED->LOW
+- Max 5 Ticker | Sortiert HIGH->MED->LOW
 - SCORE: HIGH (CONFIDENCE>=4) | MED (1.5-3.9) | LOW (1.0-1.4)
 - Bei 0 validen Signalen: TICKER_SIGNALS:NONE
 - ETFs bei Makro-Events bevorzugen"""
 
 
+# ══════════════════════════════════════════════════════════
+# HILFSFUNKTIONEN
+# ══════════════════════════════════════════════════════════
+
 def decay_weight(age_minutes: float) -> float:
     return round(math.exp(-DECAY_LAMBDA * (age_minutes / 60.0)), 4)
+
 
 def velocity_multiplier(articles: list) -> float:
     if not articles:
@@ -220,12 +221,14 @@ def velocity_multiplier(articles: list) -> float:
     elif ratio >= 0.25: return 1.25
     return 1.0
 
+
 def credibility_multiplier(sources: list) -> float:
     if not sources:
         return CREDIBILITY_DEFAULT
     scores = [CREDIBILITY.get(s["name"], CREDIBILITY_DEFAULT) for s in sources]
     avg    = sum(scores) / len(scores)
     return round(max(0.3, min(1.0, (avg - 0.50) / (0.92 - 0.50))), 4)
+
 
 def earnings_proximity_penalty(ticker: str, earnings_map: dict) -> float:
     if ticker not in earnings_map:
@@ -234,7 +237,9 @@ def earnings_proximity_penalty(ticker: str, earnings_map: dict) -> float:
     sigmoid = 1.0 / (1.0 + math.exp(-EARNINGS_K * (days - EARNINGS_CUTOFF_DAYS)))
     return round(max(0.05, sigmoid), 4)
 
+
 def calculate_sentiment(title: str, summary: str = "") -> float:
+    """Keyword-basiertes Sentiment — Fallback wenn finBERT nicht verfügbar."""
     text  = (title + " " + summary).lower()
     pos   = sum(w for p, w in SENTIMENT_POSITIVE.items() if p in text)
     neg   = sum(w for p, w in SENTIMENT_NEGATIVE.items() if p in text)
@@ -243,9 +248,11 @@ def calculate_sentiment(title: str, summary: str = "") -> float:
         return 0.0
     return max(-1.0, min(1.0, round((pos - neg) / (total + 0.001), 2)))
 
+
 def sentiment_multiplier(avg_sentiment: float) -> float:
-    """±30% Einfluss auf Confidence. Neutral=1.0, positiv>1.0, negativ<1.0."""
+    """±30% Einfluss auf Confidence."""
     return round(max(0.5, min(1.5, 1.0 + 0.3 * avg_sentiment)), 4)
+
 
 def get_market_context() -> tuple:
     now_utc = datetime.now(timezone.utc)
@@ -261,10 +268,13 @@ def get_market_context() -> tuple:
     days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
     return days[weekday] + " " + now_et.strftime("%H:%M") + " ET", status
 
+
 def parse_pub_date(date_str: str) -> datetime:
     if not date_str:
         return datetime.now(timezone.utc)
-    for fmt in ["%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S GMT", "%Y-%m-%dT%H:%M:%SZ"]:
+    for fmt in ["%a, %d %b %Y %H:%M:%S %z",
+                "%a, %d %b %Y %H:%M:%S GMT",
+                "%Y-%m-%dT%H:%M:%SZ"]:
         try:
             return datetime.strptime(date_str.strip(), fmt).replace(tzinfo=timezone.utc)
         except ValueError:
@@ -272,16 +282,23 @@ def parse_pub_date(date_str: str) -> datetime:
     return datetime.now(timezone.utc)
 
 
+# ══════════════════════════════════════════════════════════
+# RSS FETCH
+# ══════════════════════════════════════════════════════════
+
 def fetch_one_feed(feed: dict) -> list:
     try:
-        r = requests.get(feed["url"], timeout=4, headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get(feed["url"], timeout=4,
+                         headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
         root   = ET.fromstring(r.content)
         result = []
         cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+
         for item in root.findall(".//item")[:10]:
             title   = item.findtext("title", "").strip()
-            summary = re.sub(r'<[^>]+>', '', item.findtext("description", ""))[:300].strip()
+            summary = re.sub(r'<[^>]+>', '',
+                             item.findtext("description", ""))[:300].strip()
             pub_dt  = parse_pub_date(item.findtext("pubDate", ""))
             if pub_dt < cutoff or not title:
                 continue
@@ -311,6 +328,7 @@ def fetch_one_feed(feed: dict) -> list:
                 "sentiment":    calculate_sentiment(title, summary),
             })
         return result
+
     except (RequestException, Timeout) as e:
         logger.debug("Feed %s nicht erreichbar: %s", feed["name"], e)
         return []
@@ -379,6 +397,7 @@ def cluster_articles(articles: list, earnings_map: dict) -> list:
         else:
             base_key = art["hash"]
         key = base_key
+
         if key not in clusters:
             fallback = "UNKNOWN"
             if not art["tickers"]:
@@ -434,6 +453,7 @@ def cluster_articles(articles: list, earnings_map: dict) -> list:
             "feed_tier_max":    tier,
             "alter_minuten":    c["min_age"],
             "sentiment_score":  round(avg_sentiment, 2),
+            "sentiment_source": "keyword",
             "sentiment_mult":   sent_mult,
             "headline_repr":    c["top_headline"][:120],
             "confidence_score": round(final_conf, 2),
@@ -444,12 +464,43 @@ def cluster_articles(articles: list, earnings_map: dict) -> list:
         })
 
     result.sort(key=lambda x: x["confidence_score"], reverse=True)
+    result = result[:12]
+
+    # ── finBERT für Top-Cluster (Confidence > 2.0) ────────────────
+    if FINBERT_AVAILABLE:
+        top_clusters  = [c for c in result if c["confidence_score"] > 2.0]
+        top_headlines = [c["headline_repr"] for c in top_clusters]
+        if top_headlines:
+            try:
+                finbert_scores = get_finbert_sentiment_batch(top_headlines)
+                for cluster, fb_score in zip(top_clusters, finbert_scores):
+                    if fb_score != 0.0:
+                        old_conf = cluster["confidence_score"]
+                        old_mult = cluster.get("sentiment_mult", 1.0)
+                        cluster["sentiment_score"]  = fb_score
+                        cluster["sentiment_source"] = "finbert"
+                        new_mult = sentiment_multiplier(fb_score)
+                        cluster["sentiment_mult"]   = new_mult
+                        # Confidence mit neuem Sentiment-Multiplikator
+                        if old_mult > 0:
+                            cluster["confidence_score"] = round(
+                                old_conf / old_mult * new_mult, 2
+                            )
+                logger.info("finBERT: %d Top-Cluster analysiert", len(top_headlines))
+            except Exception as e:
+                logger.warning("finBERT Cluster-Update fehlgeschlagen: %s", e)
+    else:
+        logger.debug("finBERT nicht verfügbar — Keyword-Sentiment aktiv")
+
+    # Nach finBERT neu sortieren
+    result.sort(key=lambda x: x["confidence_score"], reverse=True)
     return result[:12]
 
 
 def format_clusters_for_claude(clusters: list) -> str:
     lines = []
     for c in clusters:
+        sent_src = c.get("sentiment_source", "keyword")
         lines.append(
             "CLUSTER_ID:" + c["cluster_id"] +
             " | TICKER:" + c["ticker"] +
@@ -461,6 +512,7 @@ def format_clusters_for_claude(clusters: list) -> str:
             " | DECAY:" + str(c["decay_avg"]) +
             " | VELOCITY_MULT:" + str(c["velocity_mult"]) +
             " | SENTIMENT:" + str(c["sentiment_score"]) +
+            " | SENTIMENT_SOURCE:" + sent_src +
             " | EARNINGS_PENALTY:" + str(c["earnings_penalty"]) +
             ' | HEADLINE:"' + c["headline_repr"] + '"'
         )
@@ -469,7 +521,8 @@ def format_clusters_for_claude(clusters: list) -> str:
 
 def run_claude(cluster_text: str, market_time: str, market_status: str,
                api_key: str, max_retries: int = 2) -> str:
-    prompt = PROMPT.replace("{market_time}", market_time).replace("{market_status}", market_status)
+    prompt = PROMPT.replace("{market_time}", market_time).replace(
+        "{market_status}", market_status)
     for attempt in range(max_retries):
         try:
             r = requests.post(
@@ -483,7 +536,8 @@ def run_claude(cluster_text: str, market_time: str, market_status: str,
                     "model":      "claude-sonnet-4-6",
                     "max_tokens": 200,
                     "system":     prompt,
-                    "messages":   [{"role": "user", "content": "Cluster:\n" + cluster_text}],
+                    "messages":   [{"role": "user",
+                                    "content": "Cluster:\n" + cluster_text}],
                 },
                 timeout=22,
             )
@@ -496,26 +550,33 @@ def run_claude(cluster_text: str, market_time: str, market_status: str,
                 line = line.strip()
                 if line.startswith("TICKER_SIGNALS:"):
                     signals = re.findall(
-                        r'([A-Z]{1,5}):(CALL|PUT):(HIGH|MED|LOW):(T1|T2|T3):(\d+DTE)', line
+                        r'([A-Z]{1,5}):(CALL|PUT):(HIGH|MED|LOW):(T1|T2|T3):(\d+DTE)',
+                        line
                     )
                     if signals or line == "TICKER_SIGNALS:NONE":
                         logger.info("Claude Signal: %s", line)
                         return line
         except (RequestException, Timeout) as e:
-            logger.warning("Claude-Call Versuch %d fehlgeschlagen: %s", attempt + 1, e)
+            logger.warning("Claude-Call Versuch %d: %s", attempt + 1, e)
         except (KeyError, ValueError) as e:
             logger.warning("Claude-Response Parse-Fehler: %s", e)
+
     logger.warning("Keine validen Signale nach %d Versuchen", max_retries)
     return "TICKER_SIGNALS:NONE"
 
+
+# ══════════════════════════════════════════════════════════
+# DIREKTE AUSFÜHRUNG
+# ══════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import argparse
     from config_loader import load_config, validate_config
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
 
-    parser = argparse.ArgumentParser(description="News Analyzer v3")
+    parser = argparse.ArgumentParser(description="News Analyzer v4")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--output",  help="Signale in Datei speichern")
     args = parser.parse_args()
@@ -524,23 +585,31 @@ if __name__ == "__main__":
     if not validate_config(cfg):
         raise SystemExit("Konfiguration unvollständig")
 
+    logger.info("finBERT: %s", "aktiv" if FINBERT_AVAILABLE else
+                "nicht verfügbar — Keyword-Sentiment aktiv")
+
     articles     = fetch_all_feeds()
     earnings_map = build_earnings_map(cfg.get("finnhub_key",""))
     clusters     = cluster_articles(articles, earnings_map)
 
     if len(clusters) < MIN_CLUSTERS_FOR_CLAUDE:
-        logger.warning("Nur %d Cluster — min. %d erforderlich", len(clusters), MIN_CLUSTERS_FOR_CLAUDE)
+        logger.warning("Nur %d Cluster — min. %d erforderlich",
+                       len(clusters), MIN_CLUSTERS_FOR_CLAUDE)
         print("TICKER_SIGNALS:NONE")
     else:
         if args.verbose:
             for c in clusters[:5]:
+                src = c.get("sentiment_source", "keyword")
                 print(f"  [{c['confidence_score']:.2f}] {c['ticker']:8} "
-                      f"sent={c['sentiment_score']:+.2f} {c['headline_repr'][:50]}")
+                      f"sent={c['sentiment_score']:+.2f}({src}) "
+                      f"{c['headline_repr'][:45]}")
+
         market_time, market_status = get_market_context()
         cluster_text   = format_clusters_for_claude(clusters)
         ticker_signals = run_claude(cluster_text, market_time, market_status,
                                     cfg.get("anthropic_api_key",""))
         print(ticker_signals)
+
         if args.output:
             with open(args.output, "w") as f:
                 f.write(ticker_signals)
