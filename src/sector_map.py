@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Any
 
+from rules import RULES
+
 
 SECTOR_ETFS = {
     "technology": "XLK",
@@ -100,6 +102,8 @@ class SectorFilterResult:
     market_change_pct: float | None
     qqq_change_pct: float | None
     relative_to_sector_pct: float | None
+    sector_vs_market_pct: float | None
+    momentum_confirmation: str
     score_adjustment: float
     severity: str
 
@@ -142,7 +146,8 @@ def evaluate_sector_filter(ticker: str, direction: str, stock_change_pct: float,
         return SectorFilterResult(
             ok=True, reason="Sektor-/Marktdaten fehlen; kein harter Block", sector=sector,
             sector_etf=sector_etf, sector_change_pct=None, market_change_pct=market_change,
-            qqq_change_pct=qqq_change, relative_to_sector_pct=None, score_adjustment=-3.0,
+            qqq_change_pct=qqq_change, relative_to_sector_pct=None, sector_vs_market_pct=None,
+            momentum_confirmation="unknown", score_adjustment=-3.0,
             severity="warning",
         )
 
@@ -150,8 +155,13 @@ def evaluate_sector_filter(ticker: str, direction: str, stock_change_pct: float,
     if sector_change is not None:
         rel = round(stock_change_pct - sector_change, 2)
 
+    sector_vs_market = None
+    if sector_change is not None and market_change is not None:
+        sector_vs_market = round(sector_change - market_change, 2)
+
     reasons: list[str] = []
     score_adj = 0.0
+    momentum_confirmation = "neutral"
     ok = True
     severity = "ok"
 
@@ -166,10 +176,19 @@ def evaluate_sector_filter(ticker: str, direction: str, stock_change_pct: float,
             severity = "block"
             reasons.append(f"CALL gegen schwachen Markt SPY/QQQ {market_change:.2f}%")
         if rel is not None:
-            if rel >= 0.60:
-                score_adj += 6.0
+            if rel >= RULES.sector_relative_strength_min:
+                score_adj += RULES.sector_confirms_score_bonus
+                momentum_confirmation = "stock_outperforms_sector"
             elif rel < -0.40:
-                score_adj -= 8.0
+                score_adj += RULES.sector_disagrees_score_malus
+                momentum_confirmation = "stock_lags_sector"
+        if sector_vs_market is not None:
+            if sector_vs_market >= RULES.sector_vs_market_confirm_min and direction == "CALL":
+                score_adj += 4.0
+                if momentum_confirmation == "stock_outperforms_sector":
+                    momentum_confirmation = "stock_and_sector_outperform_market"
+            elif sector_vs_market < -0.30:
+                score_adj -= 5.0
         if market_change is not None and market_change < -0.40:
             score_adj -= 4.0
 
@@ -184,10 +203,19 @@ def evaluate_sector_filter(ticker: str, direction: str, stock_change_pct: float,
             severity = "block"
             reasons.append(f"PUT gegen starken Markt SPY/QQQ {market_change:.2f}%")
         if rel is not None:
-            if rel <= -0.60:
-                score_adj += 6.0
+            if rel <= -RULES.sector_relative_strength_min:
+                score_adj += RULES.sector_confirms_score_bonus
+                momentum_confirmation = "stock_underperforms_sector"
             elif rel > 0.40:
-                score_adj -= 8.0
+                score_adj += RULES.sector_disagrees_score_malus
+                momentum_confirmation = "stock_stronger_than_sector"
+        if sector_vs_market is not None:
+            if sector_vs_market <= -RULES.sector_vs_market_confirm_min and direction == "PUT":
+                score_adj += 4.0
+                if momentum_confirmation == "stock_underperforms_sector":
+                    momentum_confirmation = "stock_and_sector_underperform_market"
+            elif sector_vs_market > 0.30:
+                score_adj -= 5.0
         if market_change is not None and market_change > 0.40:
             score_adj -= 4.0
 
@@ -208,6 +236,8 @@ def evaluate_sector_filter(ticker: str, direction: str, stock_change_pct: float,
         market_change_pct=round(market_change, 2) if market_change is not None else None,
         qqq_change_pct=round(qqq_change, 2) if qqq_change is not None else None,
         relative_to_sector_pct=rel,
+        sector_vs_market_pct=sector_vs_market,
+        momentum_confirmation=momentum_confirmation,
         score_adjustment=round(score_adj, 2),
         severity=severity,
     )
