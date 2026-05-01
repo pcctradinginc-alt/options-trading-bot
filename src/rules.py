@@ -1,14 +1,18 @@
 """
 rules.py — Zentrale Trading-Regeln
 
-v5:
-- Options-Einstieg nicht mehr blind Midpoint, sondern konservativer Entry.
-- Kostenmodell: Spread-Slippage + Mindest-EV + Fill-Wahrscheinlichkeit.
-- PUT/CALL werden getrennt validiert.
-- VIX unbekannt bleibt fail-closed.
+v7 Rational-Gates:
+- EV nur mit konsistentem Snapshot sinnvoll: Tradier-Optionen brauchen bevorzugt Tradier-Underlying.
+- Realistisches Kostenmodell: Entry-Slippage + härtere Exit-Slippage.
+- Earnings/IV-Crush-Schutz: Long-Optionen bei nahen Earnings und hoher/unklarer IV blockieren.
+- Sentiment darf Ranking unterstützen, aber keine harten Gates überschreiben.
+- No-Trade-Gründe werden maschinenlesbar journalisiert.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -27,12 +31,21 @@ class TradingRules:
     # Score-Schwellen
     min_score: int = 50
 
+    # Datenqualität / Snapshot-Konsistenz
+    # Wenn Optionsdaten von Tradier kommen, soll der Underlying-Preis ebenfalls von Tradier kommen.
+    # Falls Tradier-Quote nicht verfügbar ist, wird die Option nicht als tradebar behandelt.
+    require_tradier_quote_for_tradier_options: bool = True
+    max_quote_age_seconds: int = 900
+
     # Liquidität / Ausführbarkeit
-    # Hinweis: 2% ist sehr streng bei Optionen. Der EV-Filter ist der härtere Schutz.
     max_spread_pct: float = 6.0
+    warn_spread_pct: float = 4.0
     min_open_interest: int = 500
     min_option_volume: int = 1
     max_entry_spread_share: float = 0.50   # Entry = Mid + 50% Spread, gedeckelt durch Ask
+    base_exit_spread_share: float = 0.60   # Exit konservativer als Entry
+    high_spread_exit_share: float = 0.80
+    stress_exit_spread_share: float = 1.00
     min_fill_probability: float = 0.35
 
     # Options-EV Filter
@@ -41,26 +54,52 @@ class TradingRules:
     min_option_ev_dollars: float = 12.0    # pro Kontrakt nach Kosten
     ev_hold_days: int = 2
 
+    # IV-/Earnings-Schutz
+    # Kostenlose IV-Rank-Historie fehlt; deshalb Proxy: aktuelle IV / 20d realisierte Volatilität.
+    earnings_window_days: int = 10
+    block_long_options_if_earnings_soon: bool = True
+    block_earnings_if_iv_missing: bool = True
+    max_iv_to_rv_for_earnings: float = 1.35
+    max_iv_to_rv_general: float = 2.20
+    iv_rv_penalty_factor: float = 0.18     # reduziert EV bei sehr teurer IV außerhalb Earnings
+
     # Signal-Parsing
     valid_directions: tuple = ("CALL", "PUT")
     valid_scores: tuple = ("HIGH", "MED", "LOW")
     valid_horizons: tuple = ("T1", "T2", "T3")
     max_tickers: int = 5
 
-    # Earnings-Fenster
-    earnings_window_days: int = 10
-
 
 RULES = TradingRules()
 
 
-def _to_float(value, default=None):
+def _to_float(value: Any, default=None):
     try:
         if value is None:
             return default
         return float(str(value).replace("€", "").replace("$", "").replace(",", ".").strip())
     except (ValueError, TypeError):
         return default
+
+
+def merge_reasons(*parts: Any) -> str:
+    """Kompakter, deduplizierter No-Trade-Grund."""
+    seen = set()
+    out = []
+    for part in parts:
+        if not part:
+            continue
+        if isinstance(part, (list, tuple, set)):
+            values = part
+        else:
+            values = str(part).split("|")
+        for raw in values:
+            item = str(raw).strip()
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            out.append(item)
+    return " | ".join(out)
 
 
 # ══════════════════════════════════════════════════════════
@@ -84,6 +123,26 @@ def conservative_entry_price(options_data: dict) -> float | None:
     return round(entry, 2)
 
 
+def exit_slippage_points(options_data: dict) -> float:
+    """
+    Exit ist konservativer als Entry. Bei breiteren Spreads steigt der Haircut.
+    Rückgabe in Optionspreis-Punkten, nicht Prozent.
+    """
+    if not options_data:
+        return 0.0
+    bid = _to_float(options_data.get("bid"), 0.0)
+    ask = _to_float(options_data.get("ask"), 0.0)
+    spread_pct = _to_float(options_data.get("spread_pct"), 999.0)
+    spread = max(0.0, ask - bid)
+    if spread_pct >= 10.0:
+        share = RULES.stress_exit_spread_share
+    elif spread_pct >= RULES.warn_spread_pct:
+        share = RULES.high_spread_exit_share
+    else:
+        share = RULES.base_exit_spread_share
+    return round(spread * share, 4)
+
+
 def estimate_fill_probability(options_data: dict) -> float:
     """
     Grobe Fill-Wahrscheinlichkeit aus Spread, OI und Volumen.
@@ -102,7 +161,29 @@ def estimate_fill_probability(options_data: dict) -> float:
     return round(max(0.0, min(1.0, p)), 3)
 
 
-def check_liquidity(options_data: dict) -> tuple:
+def check_data_quality(market_data: dict, options_data: dict) -> tuple[bool, str]:
+    """
+    Prüft, ob Underlying- und Optionssnapshot zusammenpassen.
+    Fail-closed, wenn Tradier-Optionsdaten mit nicht-Tradier-Underlying kombiniert würden.
+    """
+    if not market_data:
+        return False, "Marktdaten fehlen"
+    price = _to_float(market_data.get("price"), 0.0)
+    quote_src = str(market_data.get("_src_quote") or market_data.get("quote_source") or "").lower()
+    option_src = str((options_data or {}).get("option_source") or "").lower()
+
+    if price <= 0:
+        return False, "Underlying-Preis fehlt"
+    if option_src == "tradier" and RULES.require_tradier_quote_for_tradier_options:
+        if not quote_src.startswith("tradier"):
+            return False, "Inkonsistenter Snapshot: Option Tradier aber Underlying nicht Tradier"
+    quote_age = _to_float(market_data.get("quote_age_seconds"), 0.0)
+    if quote_age and quote_age > RULES.max_quote_age_seconds:
+        return False, f"Quote zu alt: {int(quote_age)}s"
+    return True, "ok"
+
+
+def check_liquidity(options_data: dict) -> tuple[bool, str]:
     """
     Prüft Optionsliquidität als harten Filter.
     Gibt (is_liquid, reason) zurück. Fail-closed bei fehlenden Daten.
@@ -144,6 +225,27 @@ def check_liquidity(options_data: dict) -> tuple:
     return True, "ok"
 
 
+def check_earnings_iv_gate(options_data: dict, earnings_soon: bool) -> tuple[bool, str]:
+    """
+    Harte Sperre für Long-Optionen bei nahen Earnings und teurer/unklarer IV.
+    Kostenlose Daten liefern selten sauberen IV-Rank; deshalb wird IV/RV als Proxy genutzt.
+    """
+    if not earnings_soon or not RULES.block_long_options_if_earnings_soon:
+        return True, "ok"
+    iv = _to_float((options_data or {}).get("iv_decimal"))
+    rv = _to_float((options_data or {}).get("realized_vol_20d"))
+    iv_to_rv = _to_float((options_data or {}).get("iv_to_rv"))
+
+    if iv is None or iv <= 0 or rv is None or rv <= 0 or iv_to_rv is None:
+        if RULES.block_earnings_if_iv_missing:
+            return False, "Earnings nahe und IV/RV unbekannt"
+        return True, "ok"
+
+    if iv_to_rv >= RULES.max_iv_to_rv_for_earnings:
+        return False, f"Earnings nahe und IV/RV {iv_to_rv:.2f} zu hoch"
+    return True, "ok"
+
+
 # ══════════════════════════════════════════════════════════
 # VIX-REGELPRÜFUNG
 # ══════════════════════════════════════════════════════════
@@ -165,7 +267,7 @@ def apply_vix_rules(vix_direct, claude_output: dict) -> dict:
     if vix_unknown:
         result.update({
             "no_trade": True,
-            "no_trade_grund": "VIX nicht verfuegbar kein Trade",
+            "no_trade_grund": merge_reasons(result.get("no_trade_grund"), "VIX nicht verfuegbar kein Trade"),
             "vix_warnung": False,
             "einsatz": 0,
             "stop_loss_eur": 0,
@@ -176,7 +278,7 @@ def apply_vix_rules(vix_direct, claude_output: dict) -> dict:
     if vix >= RULES.vix_hard_limit:
         result.update({
             "no_trade": True,
-            "no_trade_grund": "VIX zu hoch Kapitalschutz aktiv",
+            "no_trade_grund": merge_reasons(result.get("no_trade_grund"), "VIX zu hoch Kapitalschutz aktiv"),
             "vix_warnung": False,
             "einsatz": 0,
             "stop_loss_eur": 0,
@@ -201,7 +303,7 @@ def apply_vix_rules(vix_direct, claude_output: dict) -> dict:
             if kontrakte < 1:
                 result.update({
                     "no_trade": True,
-                    "no_trade_grund": "Entry zu hoch Budget reicht nicht",
+                    "no_trade_grund": merge_reasons(result.get("no_trade_grund"), "Entry zu hoch Budget reicht nicht"),
                     "einsatz": 0,
                     "stop_loss_eur": 0,
                     "kontrakte": "n/v",
@@ -303,9 +405,10 @@ def parse_ticker_signals(raw: str) -> list:
 
         try:
             dte_days = int(dte_raw.replace("DTE", ""))
-            if dte_days <= 0 or dte_days > 180:
-                continue
         except ValueError:
+            continue
+
+        if dte_days < 7 or dte_days > 120:
             continue
 
         results.append({
@@ -317,4 +420,4 @@ def parse_ticker_signals(raw: str) -> list:
             "dte_days": dte_days,
         })
 
-    return results[:RULES.max_tickers]
+    return results
