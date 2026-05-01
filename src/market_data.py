@@ -9,13 +9,18 @@ Fixes v3:
 """
 
 import logging
+import math
+import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from datetime import datetime, timedelta
 
 import requests
 from requests.exceptions import RequestException, Timeout
 
-from rules import RULES, check_liquidity
+from rules import (
+    RULES, check_liquidity, conservative_entry_price, estimate_fill_probability,
+)
+from market_calendar import market_elapsed_fraction
 
 logger = logging.getLogger(__name__)
 
@@ -187,13 +192,10 @@ def get_history(symbol, cfg):
         return [], [], "failed"
 
     try:
-        now_utc_h = datetime.utcnow().hour + datetime.utcnow().minute / 60.0
-        delay     = MARKET_OPEN_UTC_H + VOLUME_EXTRAPOLATION_DELAY_H
-        if delay <= now_utc_h < MARKET_CLOSE_UTC_H and volumes:
-            elapsed  = now_utc_h - MARKET_OPEN_UTC_H
-            fraction = max(0.1, elapsed / 6.5)
-            volumes  = volumes.copy()
-            volumes[-1] = int(volumes[-1] / fraction)
+        fraction = market_elapsed_fraction()
+        if fraction is not None and volumes:
+            volumes = volumes.copy()
+            volumes[-1] = int(volumes[-1] / max(0.1, fraction))
     except (ValueError, ZeroDivisionError) as e:
         logger.debug("Volumen-Hochrechnung %s: %s", symbol, e)
 
@@ -264,12 +266,157 @@ def get_earnings(start, end, finnhub_key):
         return []
 
 
+
+# ══════════════════════════════════════════════════════════
+# OPTIONS-EV / KOSTENMODELL
+# ══════════════════════════════════════════════════════════
+
+def calc_realized_volatility(closes: list, lookback: int = 20) -> float | None:
+    """Annualisierte Realized Vol aus Schlusskursen, als Dezimalzahl."""
+    if not closes or len(closes) < lookback + 1:
+        return None
+    rets = []
+    recent = closes[-(lookback + 1):]
+    for prev, cur in zip(recent[:-1], recent[1:]):
+        if prev and prev > 0 and cur and cur > 0:
+            rets.append(math.log(cur / prev))
+    if len(rets) < 10:
+        return None
+    daily = statistics.stdev(rets)
+    return max(0.05, min(2.0, daily * math.sqrt(252)))
+
+
+def estimate_expected_move_pct(price: float, change_pct: float, rel_vol,
+                               score: float, closes: list, target_dte: int) -> float:
+    """
+    Erwarteter Underlying-Move in Prozent für das Signal.
+    Konservativ: nur ein Teil der historischen DTE-Vol wird als Edge akzeptiert.
+    """
+    if price <= 0:
+        return 0.0
+    rv = calc_realized_volatility(closes) or 0.35
+    days = max(1, min(target_dte, RULES.ev_hold_days))
+    vol_move_pct = rv * math.sqrt(days / 252.0) * 100.0
+    intraday_impulse = abs(change_pct) * 1.15
+    rel = 1.0
+    try:
+        rel = float(rel_vol) if rel_vol not in (None, "n/v") else 1.0
+    except (ValueError, TypeError):
+        rel = 1.0
+    rel_mult = max(0.85, min(1.35, 0.85 + 0.20 * rel))
+    score_mult = max(0.65, min(1.25, score / 70.0))
+    expected = max(intraday_impulse, vol_move_pct * 0.65) * rel_mult * score_mult
+    return round(max(0.3, min(12.0, expected)), 2)
+
+
+def _safe_float(value, default=0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
+                       expected_move_pct: float) -> dict | None:
+    """
+    Bewertet eine einzelne Long-Option auf erwarteten Vorteil nach Kosten.
+    Kein echtes Optionspreismodell, sondern robuster, konservativer Filter.
+    """
+    g = option.get("greeks") or {}
+    bid = _safe_float(option.get("bid"))
+    ask = _safe_float(option.get("ask"))
+    if bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    mid = round((bid + ask) / 2, 2)
+    spread = ask - bid
+    spread_pct = round(spread / ask * 100.0, 2) if ask > 0 else None
+    strike = _safe_float(option.get("strike"))
+    delta = _safe_float(g.get("delta"))
+    gamma = _safe_float(g.get("gamma"))
+    theta = _safe_float(g.get("theta"))
+    iv = _safe_float(g.get("mid_iv"), None)
+    oi = int(_safe_float(option.get("open_interest"), 0))
+    volume = int(_safe_float(option.get("volume"), 0))
+
+    opt_data = {
+        "bid": bid, "ask": ask, "midpoint": mid, "spread_pct": spread_pct,
+        "open_interest": oi, "volume": volume,
+    }
+    entry = conservative_entry_price(opt_data)
+    if not entry:
+        return None
+
+    # Directional expected move im Underlying.
+    move_abs = underlying_price * expected_move_pct / 100.0
+    delta_gain = abs(delta) * move_abs
+    gamma_gain = 0.5 * abs(gamma) * (move_abs ** 2)
+    theta_cost = abs(theta) * RULES.ev_hold_days if theta else 0.0
+
+    # Eintritts- und Exit-Slippage in Optionspreis-Punkten.
+    entry_slippage = max(0.0, entry - mid)
+    exit_slippage = spread * 0.35
+    expected_option_gain = max(0.0, delta_gain + gamma_gain - theta_cost)
+    ev_points = expected_option_gain - entry_slippage - exit_slippage
+    ev_dollars = round(ev_points * 100.0, 2)
+    ev_pct = round(ev_points / entry * 100.0, 2) if entry > 0 else -999.0
+
+    if direction == "CALL":
+        breakeven_move_pct = ((strike + entry - underlying_price) / underlying_price * 100.0
+                              if underlying_price > 0 else 999.0)
+    else:
+        breakeven_move_pct = ((underlying_price - (strike - entry)) / underlying_price * 100.0
+                              if underlying_price > 0 else 999.0)
+    breakeven_move_pct = round(max(0.0, breakeven_move_pct), 2)
+
+    fill_p = estimate_fill_probability(opt_data)
+    ev_ok = (
+        ev_pct >= RULES.min_option_ev_pct and
+        ev_dollars >= RULES.min_option_ev_dollars and
+        breakeven_move_pct <= expected_move_pct * 1.25 and
+        fill_p >= RULES.min_fill_probability
+    )
+
+    delta_penalty = abs(abs(delta) - RULES.target_delta_abs) * 12.0
+    liquidity_bonus = min(8.0, oi / 1000.0) + min(4.0, volume / 100.0)
+    ev_score = round(ev_pct + liquidity_bonus - delta_penalty, 2)
+
+    return {
+        "direction": direction,
+        "strike": option.get("strike"),
+        "bid": bid,
+        "ask": ask,
+        "midpoint": mid,
+        "conservative_entry": entry,
+        "entry_price": entry,
+        "spread_pct": spread_pct,
+        "delta": g.get("delta"),
+        "gamma": g.get("gamma"),
+        "theta": g.get("theta"),
+        "vega": g.get("vega"),
+        "iv": round(iv * 100, 1) if iv else None,
+        "open_interest": oi,
+        "volume": volume,
+        "fill_probability": fill_p,
+        "expected_move_pct": expected_move_pct,
+        "breakeven_move_pct": breakeven_move_pct,
+        "ev_points": round(ev_points, 3),
+        "ev_dollars": ev_dollars,
+        "ev_pct": ev_pct,
+        "ev_score": ev_score,
+        "ev_ok": ev_ok,
+        "contracts": None,
+    }
+
 # ══════════════════════════════════════════════════════════
 # TRADIER OPTIONS
 # ══════════════════════════════════════════════════════════
 
 def get_tradier_options(symbol, direction, tradier_token,
-                        sandbox=True, target_dte=21) -> dict:
+                        sandbox=True, target_dte=21, underlying_price=0.0,
+                        change_pct=0.0, closes=None, rel_vol=None,
+                        signal_score=50.0) -> dict:
     try:
         if not tradier_token:
             return {}
@@ -285,16 +432,16 @@ def get_tradier_options(symbol, direction, tradier_token,
         if not exps:
             return {}
 
-        today_dt   = datetime.now()
+        today_dt = datetime.now()
         target_exp = None
-        best_diff  = 999
+        best_diff = 999
         for exp in exps:
             days = (datetime.strptime(exp, "%Y-%m-%d") - today_dt).days
             if days < 7:
                 continue
             diff = abs(days - target_dte)
             if diff < best_diff:
-                best_diff  = diff
+                best_diff = diff
                 target_exp = exp
 
         if not target_exp:
@@ -310,44 +457,32 @@ def get_tradier_options(symbol, direction, tradier_token,
         if not opts:
             return {}
 
-        opt_type        = "call" if direction == "CALL" else "put"
-        best            = None
-        best_diff_delta = 999.0
+        opt_type = "call" if direction == "CALL" else "put"
+        expected_move_pct = estimate_expected_move_pct(
+            underlying_price, change_pct, rel_vol, signal_score, closes or [], target_dte
+        )
+
+        candidates = []
         for opt in opts:
             if opt.get("option_type") != opt_type:
                 continue
-            delta = (opt.get("greeks") or {}).get("delta")
-            if delta is None:
+            ev = evaluate_option_ev(opt, direction, underlying_price, expected_move_pct)
+            if ev is None:
                 continue
-            diff = abs(abs(float(delta)) - 0.45)
-            if diff < best_diff_delta:
-                best_diff_delta = diff
-                best            = opt
-        if not best:
+            ev["expiration"] = target_exp
+            candidates.append(ev)
+
+        if not candidates:
             return {}
 
-        g   = best.get("greeks") or {}
-        bid = float(best.get("bid", 0) or 0)
-        ask = float(best.get("ask", 0) or 0)
-        mid = round((bid + ask) / 2, 2) if bid > 0 and ask > 0 else None
+        # Erst EV-positive, liquide Kandidaten. Fallback: höchster EV-Score für Diagnose.
+        good = [c for c in candidates if c.get("ev_ok")]
+        chosen_pool = good if good else candidates
+        best = sorted(chosen_pool, key=lambda c: c.get("ev_score", -999), reverse=True)[0]
+        best["candidate_count"] = len(candidates)
+        best["ev_candidates_ok"] = len(good)
+        return best
 
-        return {
-            "direction":     direction,
-            "expiration":    target_exp,
-            "strike":        best.get("strike"),
-            "bid":           bid,
-            "ask":           ask,
-            "midpoint":      mid,
-            "spread_pct":    round((ask - bid) / ask * 100, 2) if ask > 0 else None,
-            "delta":         g.get("delta"),
-            "gamma":         g.get("gamma"),
-            "theta":         g.get("theta"),
-            "vega":          g.get("vega"),
-            "iv":            round(g.get("mid_iv", 0) * 100, 1) if g.get("mid_iv") else None,
-            "open_interest": best.get("open_interest"),
-            "volume":        best.get("volume"),
-            "contracts":     None,
-        }
     except (ValueError, KeyError, RequestException) as e:
         logger.debug("Tradier Options %s: %s", symbol, e)
         return {}
@@ -484,17 +619,30 @@ def process_ticker(ticker, direction, earnings_list, cfg,
             cfg.get("tradier_token", ""),
             cfg.get("tradier_sandbox", True),
             target_dte=target_dte,
+            underlying_price=price,
+            change_pct=change_pct,
+            closes=closes,
+            rel_vol=rel_vol,
+            signal_score=score,
         )
 
-        # Harter Liquiditäts-Filter — kein Malus mehr, sondern Ausschluss
+        # Harter Liquiditäts- und EV-Filter
         is_liquid, liquidity_reason = check_liquidity(options_data)
         if not is_liquid:
             logger.info("%s: Liquiditäts-Filter: %s", ticker, liquidity_reason)
             score        = 0.0
             score_reason = "liquidity_fail"
+        elif not options_data.get("ev_ok", False):
+            logger.info("%s: EV-Filter: EV%%=%s EV$=%s BE=%s%% expMove=%s%%",
+                        ticker, options_data.get("ev_pct"), options_data.get("ev_dollars"),
+                        options_data.get("breakeven_move_pct"), options_data.get("expected_move_pct"))
+            score        = 0.0
+            score_reason = "option_ev_fail"
+            is_liquid    = False
+            liquidity_reason = "Options-EV nach Kosten nicht ausreichend"
 
-        logger.info("%s: price=%.2f score=%.1f liquid=%s src=%s dte=%d",
-                    ticker, price, score, is_liquid, quote_src, target_dte)
+        logger.info("%s: price=%.2f score=%.1f liquid=%s ev=%s src=%s dte=%d",
+                    ticker, price, score, is_liquid, options_data.get("ev_pct"), quote_src, target_dte)
 
         return {
             "ticker":           ticker,
@@ -593,9 +741,15 @@ def build_summary(ranked, vix_value, ticker_directions,
                   " | Exp=" + str(opt.get("expiration","n/v")) +
                   " | Bid=" + str(opt.get("bid","n/v")) +
                   "/Ask=" + str(opt.get("ask","n/v")) +
+                  " | Mid=" + str(opt.get("midpoint","n/v")) +
+                  " | Entry=" + str(opt.get("conservative_entry","n/v")) +
                   " | Delta=" + str(opt.get("delta","n/v")) +
                   " | IV=" + str(opt.get("iv","n/v")) + "%" +
-                  " | OI=" + str(opt.get("open_interest","n/v")) + "\n")
+                  " | OI=" + str(opt.get("open_interest","n/v")) +
+                  " | FillP=" + str(opt.get("fill_probability","n/v")) +
+                  " | EV%=" + str(opt.get("ev_pct","n/v")) +
+                  " | EV$=" + str(opt.get("ev_dollars","n/v")) +
+                  " | EV_OK=" + str(opt.get("ev_ok", False)) + "\n")
 
     s += "\nSENTIMENT-FALLBACK: " + (
         ", ".join(d["ticker"] for d in ranked if d.get("sent_fallback")) or "keiner"
