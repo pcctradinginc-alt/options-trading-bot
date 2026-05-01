@@ -29,7 +29,10 @@ class TradingRules:
     stop_loss_pct: float = 0.30
 
     # Score-Schwellen
-    min_score: int = 50
+    # research_min_score: nur fuer Anzeige/Diagnose.
+    # min_score: finaler Trade-Kandidat; kleine Konten brauchen hoehere Selektivitaet.
+    research_min_score: int = 50
+    min_score: int = 65
 
     # Datenqualität / Snapshot-Konsistenz
     # Wenn Optionsdaten von Tradier kommen, soll der Underlying-Preis ebenfalls von Tradier kommen.
@@ -38,8 +41,14 @@ class TradingRules:
     max_quote_age_seconds: int = 900
 
     # Liquidität / Ausführbarkeit
-    max_spread_pct: float = 6.0
-    warn_spread_pct: float = 4.0
+    # Spread-Regime fuer kleine Konten:
+    # <=5% bevorzugt, 5-8% akzeptabel, 8-10% nur bei sehr starkem EV, >10% harter Block.
+    preferred_spread_pct: float = 5.0
+    caution_spread_pct: float = 8.0
+    max_spread_pct: float = 10.0
+    warn_spread_pct: float = 5.0
+    wide_spread_min_ev_pct: float = 25.0
+    wide_spread_min_ev_dollars: float = 35.0
     min_open_interest: int = 500
     min_option_volume: int = 1
     max_entry_spread_share: float = 0.50   # Entry = Mid + 50% Spread, gedeckelt durch Ask
@@ -60,7 +69,10 @@ class TradingRules:
     block_long_options_if_earnings_soon: bool = True
     block_earnings_if_iv_missing: bool = True
     max_iv_to_rv_for_earnings: float = 1.35
+    # Cold-Start-Schutz: solange eigener IV-Rank noch nicht belastbar ist, blockiert IV/RV zu teure Long-Optionen.
     max_iv_to_rv_general: float = 2.20
+    cold_start_iv_to_rv_hard_block: float = 1.50
+    mature_iv_to_rv_hard_block: float = 1.80
     iv_rv_penalty_factor: float = 0.18     # reduziert EV bei sehr teurer IV außerhalb Earnings
 
     # Signal-Parsing
@@ -80,6 +92,18 @@ class TradingRules:
     iv_rank_hard_block_long: float = 80.0
     iv_percentile_hard_block_long: float = 90.0
     iv_rank_prefer_long_below: float = 35.0
+
+    # Sektor-/Markt-Momentum. CALLs sollen relative Staerke zeigen; PUTs relative Schwaeche.
+    sector_relative_strength_min: float = 0.30
+    sector_vs_market_confirm_min: float = 0.10
+    sector_confirms_score_bonus: float = 8.0
+    sector_disagrees_score_malus: float = -12.0
+
+    # Time-Stop-Plan. Wird zunaechst journalisiert/berichtet, nicht automatisch ausgefuehrt.
+    time_stop_target_move_pct: float = 1.0
+    time_stop_short_dte_hours: int = 24      # 7-14 DTE
+    time_stop_normal_dte_hours: int = 48     # 15-30 DTE
+    time_stop_long_dte_hours: int = 72       # 31-60+ DTE
 
     # Daily-RVOL bleibt nur Diagnose, bis echte Minute-of-day-Historie aufgebaut ist.
     daily_rvol_unusual_threshold: float = 1.5
@@ -227,7 +251,18 @@ def check_liquidity(options_data: dict) -> tuple[bool, str]:
         return False, "Open Interest fehlt"
 
     if spread_pct > RULES.max_spread_pct:
-        return False, f"Spread {spread_pct:.1f}% > {RULES.max_spread_pct}% Limit"
+        return False, f"Spread {spread_pct:.1f}% > {RULES.max_spread_pct}% harter Retail-Block"
+
+    # Breite Spreads zwischen 8% und 10% duerfen nur durch sehr starken EV bestehen.
+    if spread_pct > RULES.caution_spread_pct:
+        ev_pct = _to_float(options_data.get("ev_pct"), -999.0)
+        ev_dollars = _to_float(options_data.get("ev_dollars"), -999.0)
+        if ev_pct < RULES.wide_spread_min_ev_pct or ev_dollars < RULES.wide_spread_min_ev_dollars:
+            return False, (
+                f"Spread {spread_pct:.1f}% > {RULES.caution_spread_pct}% nur bei starkem EV handelbar "
+                f"(EV% {ev_pct}, EV$ {ev_dollars})"
+            )
+
     if open_int < RULES.min_open_interest:
         return False, f"OI {int(open_int)} < {RULES.min_open_interest} Limit"
     if volume < RULES.min_option_volume:
@@ -260,6 +295,36 @@ def check_earnings_iv_gate(options_data: dict, earnings_soon: bool) -> tuple[boo
         return False, f"Earnings nahe und IV/RV {iv_to_rv:.2f} zu hoch"
     return True, "ok"
 
+
+
+
+def build_time_stop_plan(direction: str, dte_actual: int | None) -> dict:
+    """
+    Options-Time-Stop: Wenn der Underlying nach kurzer Zeit nicht in Zielrichtung laeuft,
+    ist die Long-Option wegen Theta/Spread statistisch schlechter.
+    Das ist ein Exit-Pruefplan, keine automatische Order.
+    """
+    try:
+        dte = int(dte_actual or 0)
+    except (TypeError, ValueError):
+        dte = 0
+
+    if dte <= 14:
+        hours = RULES.time_stop_short_dte_hours
+    elif dte <= 30:
+        hours = RULES.time_stop_normal_dte_hours
+    else:
+        hours = RULES.time_stop_long_dte_hours
+
+    sign = "+" if str(direction).upper() == "CALL" else "-"
+    return {
+        "time_stop_hours": hours,
+        "time_stop_required_move_pct": RULES.time_stop_target_move_pct,
+        "time_stop_rule": (
+            f"Nach {hours}h pruefen: Underlying muss {sign}{RULES.time_stop_target_move_pct:.1f}% "
+            f"in Zielrichtung gelaufen sein, sonst Exit/Close pruefen"
+        ),
+    }
 
 # ══════════════════════════════════════════════════════════
 # VIX-REGELPRÜFUNG
