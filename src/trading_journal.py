@@ -110,6 +110,17 @@ def init_db(con: sqlite3.Connection) -> None:
             exit_slippage_points REAL,
             earnings_iv_ok INTEGER,
             earnings_iv_reason TEXT,
+            sector TEXT,
+            sector_etf TEXT,
+            sector_change_pct REAL,
+            market_change_pct REAL,
+            relative_to_sector_pct REAL,
+            sector_filter_ok INTEGER,
+            sector_filter_reason TEXT,
+            sentiment_price_label TEXT,
+            sentiment_price_score_adjustment REAL,
+            data_quality_score REAL,
+            price_spike_pct REAL,
             selected_trade INTEGER DEFAULT 0,
             FOREIGN KEY(run_id) REFERENCES runs(run_id)
         );
@@ -145,6 +156,17 @@ def init_db(con: sqlite3.Connection) -> None:
         "exit_slippage_points": "REAL",
         "earnings_iv_ok": "INTEGER",
         "earnings_iv_reason": "TEXT",
+        "sector": "TEXT",
+        "sector_etf": "TEXT",
+        "sector_change_pct": "REAL",
+        "market_change_pct": "REAL",
+        "relative_to_sector_pct": "REAL",
+        "sector_filter_ok": "INTEGER",
+        "sector_filter_reason": "TEXT",
+        "sentiment_price_label": "TEXT",
+        "sentiment_price_score_adjustment": "REAL",
+        "data_quality_score": "REAL",
+        "price_spike_pct": "REAL",
     })
     con.commit()
 
@@ -237,8 +259,11 @@ def log_market_signals(run_id: int, parsed_signals: list[dict], market_data: lis
                 score, score_reason, liquidity_fail, liquidity_reason, ev_ok, ev_pct,
                 ev_dollars, conservative_entry, data_quality_ok, data_quality_reason,
                 no_trade_reason, quote_source, option_source, realized_vol_20d, option_iv,
-                iv_to_rv, exit_slippage_points, earnings_iv_ok, earnings_iv_reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                iv_to_rv, exit_slippage_points, earnings_iv_ok, earnings_iv_reason,
+                sector, sector_etf, sector_change_pct, market_change_pct, relative_to_sector_pct,
+                sector_filter_ok, sector_filter_reason, sentiment_price_label,
+                sentiment_price_score_adjustment, data_quality_score, price_spike_pct
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id, iso(created), ticker, d.get("news_direction") or ps.get("direction"),
@@ -253,6 +278,11 @@ def log_market_signals(run_id: int, parsed_signals: list[dict], market_data: lis
                 d.get("realized_vol_20d"), opt.get("iv_decimal"), opt.get("iv_to_rv"),
                 opt.get("exit_slippage_points"), 1 if opt.get("earnings_iv_ok", True) else 0,
                 opt.get("earnings_iv_reason", ""),
+                d.get("sector"), d.get("sector_etf"), d.get("sector_change_pct"),
+                d.get("market_change_pct"), d.get("relative_to_sector_pct"),
+                1 if d.get("sector_filter_ok", True) else 0, d.get("sector_filter_reason", ""),
+                d.get("sentiment_price_label", ""), d.get("sentiment_price_score_adjustment"),
+                d.get("data_quality_score"), d.get("price_spike_pct"),
             ),
         )
         signal_id = int(cur.lastrowid)
