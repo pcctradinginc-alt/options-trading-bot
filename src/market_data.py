@@ -1,12 +1,12 @@
 """
 market_data.py — Marktdaten + Score-Berechnung (Step 2)
 
-v7 Rational-Gates:
-- Tradier-Underlying-Quote bevorzugt, wenn Tradier-Optionen genutzt werden.
-- Keine lineare Intraday-Volumen-Hochrechnung mehr als Alpha-Signal.
-- Options-EV mit härterer Exit-Slippage und IV/RV-Penalty.
-- Earnings/IV-Crush wird als harter Long-Options-Block behandelt.
-- no_trade_reason wird pro Ticker sauber propagiert.
+v8 Rational-Gates:
+- Tradier Production ist Standard; Sandbox nur explizit via TRADIER_SANDBOX=true.
+- Datenvalidator markiert kaputte Historien, Spikes und fehlende Volumendaten.
+- Markt-/Sektorfilter prüft SPY/QQQ/Sektor-ETF gegen das Einzeltitelsignal.
+- Sentiment-vs-Preisreaktion wird als Absorption/Distribution-Feature gespeichert.
+- Options-EV bleibt fail-closed mit IV/RV-, Earnings-, Slippage- und Liquiditätsgates.
 """
 
 import logging
@@ -23,12 +23,17 @@ from rules import (
     exit_slippage_points, check_data_quality, check_earnings_iv_gate, merge_reasons,
 )
 from market_calendar import market_elapsed_fraction
+from data_validator import (
+    validate_ohlcv_history, detect_unexplained_price_spike,
+    data_flags_to_text, realized_volatility,
+)
+from sector_map import evaluate_sector_filter
 
 logger = logging.getLogger(__name__)
 
 ETF_TICKERS = {
     'TLT','USO','GLD','SLV','GDX','SPY','QQQ','IWM','DIA',
-    'XLE','XLF','XLK','XLV','XLI','XLU','XLP','XLY','XLB','XLRE',
+    'XLE','XLF','XLK','XLV','XLI','XLU','XLP','XLY','XLB','XLRE','XLC','SMH','SOXX',
 }
 
 USER_AGENTS = [
@@ -64,7 +69,7 @@ def robust_get(url, params=None, headers=None, timeouts=(6, 8, 10)):
 # KURS-QUELLEN
 # ══════════════════════════════════════════════════════════
 
-def get_quote_tradier(symbol, tradier_token, sandbox=True):
+def get_quote_tradier(symbol, tradier_token, sandbox=False):
     """Underlying-Quote aus derselben Datenfamilie wie Tradier-Optionsdaten."""
     if not tradier_token:
         return None
@@ -90,7 +95,7 @@ def get_quote_tradier(symbol, tradier_token, sandbox=True):
         low = q.get("low") or price
         # Tradier liefert je nach Endpoint/Plan kein einheitliches Quote-Alter.
         return (round(float(price), 2), round(float(chg_pct), 2),
-                round(float(high), 2), round(float(low), 2), "tradier")
+                round(float(high), 2), round(float(low), 2), "tradier_sandbox" if sandbox else "tradier_production")
     except (ValueError, KeyError, RequestException) as e:
         logger.debug("Tradier quote %s: %s", symbol, e)
         return None
@@ -192,7 +197,7 @@ def get_quote_finnhub(symbol, api_key):
 def get_quote(symbol, cfg):
     # Für Options-EV ist Tradier bevorzugt, weil Optionsdaten ebenfalls von Tradier kommen.
     sources = [
-        (get_quote_tradier, (symbol, cfg.get("tradier_token", ""), cfg.get("tradier_sandbox", True))),
+        (get_quote_tradier, (symbol, cfg.get("tradier_token", ""), cfg.get("tradier_sandbox", False))),
         (get_quote_alphavantage, (symbol, cfg.get("alpha_vantage_key",""))),
         (get_quote_yahoo_v8,     (symbol,)),
         (get_quote_finnhub,      (symbol, cfg.get("finnhub_key",""))),
@@ -258,6 +263,49 @@ def get_sentiment(symbol, change_pct, finnhub_key):
     bullish = round(max(0.0, min(100.0,
         55 + change_pct * 3 if change_pct > 0 else 45 + change_pct * 3)), 1)
     return bullish, round(100.0 - bullish, 1), round(abs(change_pct), 2), True
+
+
+def classify_sentiment_price_reaction(direction: str, bullish: float, bearish: float,
+                                      change_pct: float, sent_fallback: bool) -> dict:
+    """
+    Divergenz statt simpler Sentiment-Logik:
+    - Negative News, aber Kurs fällt nicht weiter => Absorption, potenziell bullish.
+    - Positive News, aber Kurs steigt nicht => Distribution, potenziell bearish.
+
+    Dieses Feature ist Ranking-/Diagnose-Input. Es überschreibt niemals EV-, Liquiditäts- oder Daten-Gates.
+    """
+    direction = (direction or "").upper()
+    b = float(bullish or 0.0)
+    br = float(bearish or 0.0)
+    gap = b - br
+    label = "neutral"
+    score_adjustment = 0.0
+    confidence = "low" if sent_fallback else "medium"
+
+    if br - b >= 15 and change_pct >= -0.20:
+        label = "bearish_news_absorbed"
+        confidence = "medium" if not sent_fallback else "low"
+        score_adjustment = 5.0 if direction == "CALL" else -5.0
+    elif b - br >= 15 and change_pct <= 0.10:
+        label = "bullish_news_not_confirmed"
+        confidence = "medium" if not sent_fallback else "low"
+        score_adjustment = 5.0 if direction == "PUT" else -6.0
+    elif gap >= 20 and change_pct > 0.40:
+        label = "bullish_confirmed"
+        score_adjustment = 3.0 if direction == "CALL" else -3.0
+    elif gap <= -20 and change_pct < -0.40:
+        label = "bearish_confirmed"
+        score_adjustment = 3.0 if direction == "PUT" else -3.0
+
+    if sent_fallback:
+        score_adjustment *= 0.5
+
+    return {
+        "sentiment_price_label": label,
+        "sentiment_price_score_adjustment": round(score_adjustment, 2),
+        "sentiment_price_confidence": confidence,
+        "sentiment_gap": round(gap, 2),
+    }
 
 
 # ══════════════════════════════════════════════════════════
@@ -470,7 +518,7 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
 # ══════════════════════════════════════════════════════════
 
 def get_tradier_options(symbol, direction, tradier_token,
-                        sandbox=True, target_dte=21, underlying_price=0.0,
+                        sandbox=False, target_dte=21, underlying_price=0.0,
                         change_pct=0.0, closes=None, rel_vol=None,
                         signal_score=50.0, earnings_soon=False) -> dict:
     try:
@@ -675,6 +723,16 @@ def process_ticker(ticker, direction, earnings_list, cfg,
             }
 
         bullish, bearish, buzz, sent_fallback = get_sentiment(ticker, change_pct, finnhub_key)
+        sentiment_reaction = classify_sentiment_price_reaction(direction, bullish, bearish, change_pct, sent_fallback)
+
+        # Datenhärtung: Daily-Historie und große Spikes prüfen.
+        history_validation = validate_ohlcv_history(closes, volumes)
+        spike_validation = detect_unexplained_price_spike(
+            price, closes, news_signal_present=True, threshold_pct=10.0
+        ) if closes else None
+        data_validation_reason = data_flags_to_text(history_validation, spike_validation)
+        data_validation_ok = bool(history_validation.ok and (spike_validation.ok if spike_validation else True))
+
         rel_vol = calc_rel_volume(volumes)
         # RelVol bleibt Diagnose. Es ist kein harter Alpha-Beweis, da keine Intraday-U-Kurve genutzt wird.
         unusual = bool(rel_vol and rel_vol >= 1.5)
@@ -692,10 +750,16 @@ def process_ticker(ticker, direction, earnings_list, cfg,
             price, change_pct, above_ma50, ma20, direction,
             bullish, unusual, earnings_soon, is_etf)
 
+        sector_result = evaluate_sector_filter(ticker, direction, change_pct, cfg, get_quote)
+        score = round(max(0.0, min(100.0,
+            score + sector_result.score_adjustment + sentiment_reaction.get("sentiment_price_score_adjustment", 0.0)
+        )), 2)
+        score_reason = score_reason + "; sector=" + sector_result.severity + "; sent_price=" + sentiment_reaction.get("sentiment_price_label", "neutral")
+
         options_data = get_tradier_options(
             ticker, direction,
             cfg.get("tradier_token", ""),
-            cfg.get("tradier_sandbox", True),
+            cfg.get("tradier_sandbox", False),
             target_dte=target_dte,
             underlying_price=price,
             change_pct=change_pct,
@@ -705,14 +769,19 @@ def process_ticker(ticker, direction, earnings_list, cfg,
             earnings_soon=earnings_soon,
         )
 
-        market_stub = {"price": price, "_src_quote": quote_src, "quote_age_seconds": quote_age_seconds}
-        data_ok, data_reason = check_data_quality(market_stub, options_data)
+        market_stub = {"price": price, "_src_quote": quote_src, "quote_source": quote_src, "quote_age_seconds": quote_age_seconds}
+        snapshot_ok, snapshot_reason = check_data_quality(market_stub, options_data)
+        data_ok = bool(snapshot_ok and data_validation_ok)
+        data_reason = merge_reasons(snapshot_reason if not snapshot_ok else "", data_validation_reason if data_validation_reason != "ok" else "") or "ok"
         is_liquid, liquidity_reason = check_liquidity(options_data)
         ev_ok = bool(options_data.get("ev_ok"))
+        sector_ok = bool(sector_result.ok)
 
         no_trade_reason = []
         if not data_ok:
             no_trade_reason.append(data_reason)
+        if not sector_ok:
+            no_trade_reason.append(sector_result.reason)
         if not is_liquid:
             no_trade_reason.append(liquidity_reason)
         if not ev_ok:
@@ -742,6 +811,23 @@ def process_ticker(ticker, direction, earnings_list, cfg,
             "change_pct": change_pct,
             "rel_vol": str(rel_vol) if rel_vol is not None else "n/v",
             "rel_vol_quality": "daily_only_no_intraday_curve",
+            "data_validation_ok": data_validation_ok,
+            "data_validation_reason": data_validation_reason,
+            "data_quality_score": getattr(history_validation, "quality_score", None),
+            "price_spike_pct": getattr(spike_validation, "spike_pct", None) if spike_validation else None,
+            "sector": sector_result.sector,
+            "sector_etf": sector_result.sector_etf,
+            "sector_change_pct": sector_result.sector_change_pct,
+            "market_change_pct": sector_result.market_change_pct,
+            "qqq_change_pct": sector_result.qqq_change_pct,
+            "relative_to_sector_pct": sector_result.relative_to_sector_pct,
+            "sector_filter_ok": sector_result.ok,
+            "sector_filter_reason": sector_result.reason,
+            "sector_score_adjustment": sector_result.score_adjustment,
+            "sentiment_price_label": sentiment_reaction.get("sentiment_price_label"),
+            "sentiment_price_score_adjustment": sentiment_reaction.get("sentiment_price_score_adjustment"),
+            "sentiment_price_confidence": sentiment_reaction.get("sentiment_price_confidence"),
+            "sentiment_gap": sentiment_reaction.get("sentiment_gap"),
             "unusual": unusual,
             "ma50": ma50,
             "ma20": ma20,
