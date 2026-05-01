@@ -1,24 +1,26 @@
 """
 market_data.py — Marktdaten + Score-Berechnung (Step 2)
 
-Fixes v3:
-- Liquidität als harter Filter via check_liquidity() (nicht Malus)
-- Fail-Closed: fehlende Bid/Ask/Midpoint → score=0, _liquidity_fail=True
-- get_tradier_options() nutzt target_dte
-- Logging statt print()
+v7 Rational-Gates:
+- Tradier-Underlying-Quote bevorzugt, wenn Tradier-Optionen genutzt werden.
+- Keine lineare Intraday-Volumen-Hochrechnung mehr als Alpha-Signal.
+- Options-EV mit härterer Exit-Slippage und IV/RV-Penalty.
+- Earnings/IV-Crush wird als harter Long-Options-Block behandelt.
+- no_trade_reason wird pro Ticker sauber propagiert.
 """
 
 import logging
 import math
 import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 from requests.exceptions import RequestException, Timeout
 
 from rules import (
     RULES, check_liquidity, conservative_entry_price, estimate_fill_probability,
+    exit_slippage_points, check_data_quality, check_earnings_iv_gate, merge_reasons,
 )
 from market_calendar import market_elapsed_fraction
 
@@ -61,6 +63,38 @@ def robust_get(url, params=None, headers=None, timeouts=(6, 8, 10)):
 # ══════════════════════════════════════════════════════════
 # KURS-QUELLEN
 # ══════════════════════════════════════════════════════════
+
+def get_quote_tradier(symbol, tradier_token, sandbox=True):
+    """Underlying-Quote aus derselben Datenfamilie wie Tradier-Optionsdaten."""
+    if not tradier_token:
+        return None
+    try:
+        base = "https://sandbox.tradier.com" if sandbox else "https://api.tradier.com"
+        hdrs = {"Authorization": "Bearer " + tradier_token, "Accept": "application/json"}
+        r = robust_get(base + "/v1/markets/quotes",
+                       params={"symbols": symbol, "greeks": "false"},
+                       headers=hdrs)
+        if not r:
+            return None
+        q = (r.json().get("quotes") or {}).get("quote")
+        if isinstance(q, list):
+            q = q[0] if q else None
+        if not q:
+            return None
+        price = q.get("last") or q.get("close") or q.get("bid") or q.get("ask")
+        if not price or float(price) <= 0:
+            return None
+        prev = q.get("prevclose") or q.get("open") or price
+        chg_pct = ((float(price) - float(prev)) / float(prev) * 100.0) if prev else 0.0
+        high = q.get("high") or price
+        low = q.get("low") or price
+        # Tradier liefert je nach Endpoint/Plan kein einheitliches Quote-Alter.
+        return (round(float(price), 2), round(float(chg_pct), 2),
+                round(float(high), 2), round(float(low), 2), "tradier")
+    except (ValueError, KeyError, RequestException) as e:
+        logger.debug("Tradier quote %s: %s", symbol, e)
+        return None
+
 
 def get_quote_alphavantage(symbol, api_key):
     try:
@@ -156,11 +190,14 @@ def get_quote_finnhub(symbol, api_key):
 
 
 def get_quote(symbol, cfg):
-    for fn, args in [
+    # Für Options-EV ist Tradier bevorzugt, weil Optionsdaten ebenfalls von Tradier kommen.
+    sources = [
+        (get_quote_tradier, (symbol, cfg.get("tradier_token", ""), cfg.get("tradier_sandbox", True))),
         (get_quote_alphavantage, (symbol, cfg.get("alpha_vantage_key",""))),
         (get_quote_yahoo_v8,     (symbol,)),
         (get_quote_finnhub,      (symbol, cfg.get("finnhub_key",""))),
-    ]:
+    ]
+    for fn, args in sources:
         result = fn(*args)
         if result:
             return result
@@ -191,14 +228,9 @@ def get_history(symbol, cfg):
     if not closes:
         return [], [], "failed"
 
-    try:
-        fraction = market_elapsed_fraction()
-        if fraction is not None and volumes:
-            volumes = volumes.copy()
-            volumes[-1] = int(volumes[-1] / max(0.1, fraction))
-    except (ValueError, ZeroDivisionError) as e:
-        logger.debug("Volumen-Hochrechnung %s: %s", symbol, e)
-
+    # Keine lineare Intraday-Volumen-Hochrechnung mehr.
+    # Das frühere volumes[-1] / fraction erzeugte in der US-Session false positives,
+    # weil Volumen intraday typischerweise nicht linear verläuft.
     source = "alphavantage" if cfg.get("alpha_vantage_key") else "yahoo"
     return closes, volumes, source
 
@@ -319,10 +351,14 @@ def _safe_float(value, default=0.0) -> float:
 
 
 def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
-                       expected_move_pct: float) -> dict | None:
+                       expected_move_pct: float, realized_vol_20d: float | None = None) -> dict | None:
     """
     Bewertet eine einzelne Long-Option auf erwarteten Vorteil nach Kosten.
-    Kein echtes Optionspreismodell, sondern robuster, konservativer Filter.
+    Kein vollwertiges Black-Scholes-Modell, aber konservativer als Delta-only:
+    - Entry zwischen Mid und Ask
+    - Exit-Slippage härter als Entry
+    - IV/RV-Penalty bei sehr teurer IV
+    - keine Sentiment-Komponente im EV
     """
     g = option.get("greeks") or {}
     bid = _safe_float(option.get("bid"))
@@ -336,7 +372,8 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
     delta = _safe_float(g.get("delta"))
     gamma = _safe_float(g.get("gamma"))
     theta = _safe_float(g.get("theta"))
-    iv = _safe_float(g.get("mid_iv"), None)
+    iv_raw = g.get("mid_iv") or g.get("ask_iv") or g.get("bid_iv")
+    iv = _safe_float(iv_raw, None)
     oi = int(_safe_float(option.get("open_interest"), 0))
     volume = int(_safe_float(option.get("volume"), 0))
 
@@ -348,17 +385,24 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
     if not entry:
         return None
 
-    # Directional expected move im Underlying.
     move_abs = underlying_price * expected_move_pct / 100.0
     delta_gain = abs(delta) * move_abs
     gamma_gain = 0.5 * abs(gamma) * (move_abs ** 2)
     theta_cost = abs(theta) * RULES.ev_hold_days if theta else 0.0
 
-    # Eintritts- und Exit-Slippage in Optionspreis-Punkten.
     entry_slippage = max(0.0, entry - mid)
-    exit_slippage = spread * 0.35
+    exit_slip = exit_slippage_points(opt_data)
+
+    iv_to_rv = None
+    iv_rv_penalty = 0.0
+    if iv and realized_vol_20d and realized_vol_20d > 0:
+        iv_to_rv = round(iv / realized_vol_20d, 3)
+        if iv_to_rv > RULES.max_iv_to_rv_general:
+            # Keine harte Sperre außerhalb Earnings, aber EV wird konservativ reduziert.
+            iv_rv_penalty = entry * min(0.35, (iv_to_rv - RULES.max_iv_to_rv_general) * RULES.iv_rv_penalty_factor)
+
     expected_option_gain = max(0.0, delta_gain + gamma_gain - theta_cost)
-    ev_points = expected_option_gain - entry_slippage - exit_slippage
+    ev_points = expected_option_gain - entry_slippage - exit_slip - iv_rv_penalty
     ev_dollars = round(ev_points * 100.0, 2)
     ev_pct = round(ev_points / entry * 100.0, 2) if entry > 0 else -999.0
 
@@ -371,13 +415,17 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
     breakeven_move_pct = round(max(0.0, breakeven_move_pct), 2)
 
     fill_p = estimate_fill_probability(opt_data)
-    ev_ok = (
-        ev_pct >= RULES.min_option_ev_pct and
-        ev_dollars >= RULES.min_option_ev_dollars and
-        breakeven_move_pct <= expected_move_pct * 1.25 and
-        fill_p >= RULES.min_fill_probability
-    )
+    ev_reasons = []
+    if ev_pct < RULES.min_option_ev_pct:
+        ev_reasons.append(f"EV% {ev_pct} < {RULES.min_option_ev_pct}")
+    if ev_dollars < RULES.min_option_ev_dollars:
+        ev_reasons.append(f"EV$ {ev_dollars} < {RULES.min_option_ev_dollars}")
+    if breakeven_move_pct > expected_move_pct * 1.25:
+        ev_reasons.append("Break-even-Move zu hoch")
+    if fill_p < RULES.min_fill_probability:
+        ev_reasons.append(f"FillP {fill_p} < {RULES.min_fill_probability}")
 
+    ev_ok = not ev_reasons
     delta_penalty = abs(abs(delta) - RULES.target_delta_abs) * 12.0
     liquidity_bonus = min(8.0, oi / 1000.0) + min(4.0, volume / 100.0)
     ev_score = round(ev_pct + liquidity_bonus - delta_penalty, 2)
@@ -396,16 +444,24 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
         "theta": g.get("theta"),
         "vega": g.get("vega"),
         "iv": round(iv * 100, 1) if iv else None,
+        "iv_decimal": round(iv, 5) if iv else None,
+        "realized_vol_20d": round(realized_vol_20d, 5) if realized_vol_20d else None,
+        "iv_to_rv": iv_to_rv,
+        "iv_rv_penalty": round(iv_rv_penalty, 4),
         "open_interest": oi,
         "volume": volume,
         "fill_probability": fill_p,
         "expected_move_pct": expected_move_pct,
         "breakeven_move_pct": breakeven_move_pct,
+        "entry_slippage_points": round(entry_slippage, 4),
+        "exit_slippage_points": exit_slip,
         "ev_points": round(ev_points, 3),
         "ev_dollars": ev_dollars,
         "ev_pct": ev_pct,
         "ev_score": ev_score,
         "ev_ok": ev_ok,
+        "ev_fail_reason": merge_reasons(ev_reasons),
+        "option_source": "tradier",
         "contracts": None,
     }
 
@@ -416,10 +472,10 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
 def get_tradier_options(symbol, direction, tradier_token,
                         sandbox=True, target_dte=21, underlying_price=0.0,
                         change_pct=0.0, closes=None, rel_vol=None,
-                        signal_score=50.0) -> dict:
+                        signal_score=50.0, earnings_soon=False) -> dict:
     try:
         if not tradier_token:
-            return {}
+            return {"option_source": "none", "ev_ok": False, "ev_fail_reason": "Tradier Token fehlt"}
         base = "https://sandbox.tradier.com" if sandbox else "https://api.tradier.com"
         hdrs = {"Authorization": "Bearer " + tradier_token, "Accept": "application/json"}
 
@@ -427,14 +483,15 @@ def get_tradier_options(symbol, direction, tradier_token,
                            params={"symbol": symbol, "includeAllRoots": "true"},
                            headers=hdrs)
         if not r_exp:
-            return {}
+            return {"option_source": "tradier", "ev_ok": False, "ev_fail_reason": "Options-Expirations nicht verfügbar"}
         exps = r_exp.json().get("expirations", {}).get("date", [])
         if not exps:
-            return {}
+            return {"option_source": "tradier", "ev_ok": False, "ev_fail_reason": "Keine Expirations"}
 
         today_dt = datetime.now()
         target_exp = None
         best_diff = 999
+        target_days = None
         for exp in exps:
             days = (datetime.strptime(exp, "%Y-%m-%d") - today_dt).days
             if days < 7:
@@ -443,21 +500,25 @@ def get_tradier_options(symbol, direction, tradier_token,
             if diff < best_diff:
                 best_diff = diff
                 target_exp = exp
+                target_days = days
 
         if not target_exp:
-            return {}
+            return {"option_source": "tradier", "ev_ok": False, "ev_fail_reason": "Keine passende Laufzeit"}
 
         r_chain = robust_get(base + "/v1/markets/options/chains",
                              params={"symbol": symbol, "expiration": target_exp,
                                      "greeks": "true"},
                              headers=hdrs)
         if not r_chain:
-            return {}
+            return {"option_source": "tradier", "ev_ok": False, "expiration": target_exp,
+                    "ev_fail_reason": "Options-Chain nicht verfügbar"}
         opts = r_chain.json().get("options", {}).get("option", [])
         if not opts:
-            return {}
+            return {"option_source": "tradier", "ev_ok": False, "expiration": target_exp,
+                    "ev_fail_reason": "Options-Chain leer"}
 
         opt_type = "call" if direction == "CALL" else "put"
+        rv20 = calc_realized_volatility(closes or [])
         expected_move_pct = estimate_expected_move_pct(
             underlying_price, change_pct, rel_vol, signal_score, closes or [], target_dte
         )
@@ -466,27 +527,36 @@ def get_tradier_options(symbol, direction, tradier_token,
         for opt in opts:
             if opt.get("option_type") != opt_type:
                 continue
-            ev = evaluate_option_ev(opt, direction, underlying_price, expected_move_pct)
+            ev = evaluate_option_ev(opt, direction, underlying_price, expected_move_pct,
+                                    realized_vol_20d=rv20)
             if ev is None:
                 continue
             ev["expiration"] = target_exp
+            ev["dte_actual"] = target_days
+            ok_earnings, earnings_reason = check_earnings_iv_gate(ev, earnings_soon)
+            ev["earnings_iv_ok"] = ok_earnings
+            ev["earnings_iv_reason"] = earnings_reason
+            if not ok_earnings:
+                ev["ev_ok"] = False
+                ev["ev_fail_reason"] = merge_reasons(ev.get("ev_fail_reason"), earnings_reason)
             candidates.append(ev)
 
         if not candidates:
-            return {}
+            return {"option_source": "tradier", "ev_ok": False, "expiration": target_exp,
+                    "ev_fail_reason": "Keine bewertbaren Optionen"}
 
-        # Erst EV-positive, liquide Kandidaten. Fallback: höchster EV-Score für Diagnose.
         good = [c for c in candidates if c.get("ev_ok")]
         chosen_pool = good if good else candidates
         best = sorted(chosen_pool, key=lambda c: c.get("ev_score", -999), reverse=True)[0]
         best["candidate_count"] = len(candidates)
         best["ev_candidates_ok"] = len(good)
+        if not best.get("ev_ok") and not best.get("ev_fail_reason"):
+            best["ev_fail_reason"] = "Kein Kandidat nach EV/Kosten/Earnings-Gates"
         return best
 
     except (ValueError, KeyError, RequestException) as e:
         logger.debug("Tradier Options %s: %s", symbol, e)
-        return {}
-
+        return {"option_source": "tradier", "ev_ok": False, "ev_fail_reason": "Tradier Options Fehler"}
 
 # ══════════════════════════════════════════════════════════
 # INDIKATOREN
@@ -514,17 +584,21 @@ def calc_rel_volume(volumes):
 
 def calculate_score(price, change_pct, above_ma50, ma20,
                     direction, bullish, unusual, earnings_soon, is_etf):
+    """
+    Struktur-Score ohne Sentiment-Multiplikator.
+    Sentiment darf später nur als kleine Ranking-Info dienen, nicht harte Gates überschreiben.
+    """
     if price <= 0:
         return 0.0, "no_price"
 
-    base     = 50.0
-    momentum = min(30.0, abs(change_pct) * 8)
+    base = 50.0
+    momentum = min(25.0, abs(change_pct) * 7)
 
     trend_bonus = 0.0
     if direction == "CALL" and above_ma50 is True:
-        trend_bonus = 20.0
+        trend_bonus = 18.0
     elif direction == "PUT" and above_ma50 is False:
-        trend_bonus = 20.0
+        trend_bonus = 18.0
 
     direction_malus = 0.0
     if direction == "CALL" and change_pct < -0.5:
@@ -532,23 +606,22 @@ def calculate_score(price, change_pct, above_ma50, ma20,
     elif direction == "PUT" and change_pct > 0.5:
         direction_malus = -35.0
 
-    extra = 0.0
-    if not is_etf:
-        extra += bullish * 0.3
-        extra += 20.0 if unusual else 0.0
-        extra -= 50.0 if earnings_soon else 0.0
+    volume_bonus = 0.0 if is_etf else (12.0 if unusual else 0.0)
+
+    # Earnings sind kein Score-Malus mehr. Der eigentliche Schutz sitzt als hartes IV/Earnings-Gate
+    # im Optionsblock. So bleibt die Diagnose sauber: Score kann gut sein, Trade trotzdem blockiert.
 
     etf_roc_bonus = 0.0
     if is_etf and ma20 and price > 0:
         roc = (price - ma20) / ma20 * 100
         if direction == "CALL" and roc > 0:
-            etf_roc_bonus = min(15.0, roc * 2)
+            etf_roc_bonus = min(12.0, roc * 2)
         elif direction == "PUT" and roc < 0:
-            etf_roc_bonus = min(15.0, abs(roc) * 2)
+            etf_roc_bonus = min(12.0, abs(roc) * 2)
 
-    raw   = base + momentum + trend_bonus + direction_malus + extra + etf_roc_bonus
+    raw = base + momentum + trend_bonus + direction_malus + volume_bonus + etf_roc_bonus
     score = round(max(0.0, min(100.0, raw)), 2)
-    return score, "calculated"
+    return score, "calculated_structural_no_sentiment"
 
 
 # ══════════════════════════════════════════════════════════
@@ -558,14 +631,14 @@ def calculate_score(price, change_pct, above_ma50, ma20,
 
 def process_ticker(ticker, direction, earnings_list, cfg,
                    target_dte: int = 21) -> dict:
-    is_etf      = ticker in ETF_TICKERS
+    is_etf = ticker in ETF_TICKERS
     finnhub_key = cfg.get("finnhub_key", "")
     q_fut: Future = None
     h_fut: Future = None
 
     try:
         executor = ThreadPoolExecutor(max_workers=2)
-        q_fut = executor.submit(get_quote,   ticker, cfg)
+        q_fut = executor.submit(get_quote, ticker, cfg)
         h_fut = executor.submit(get_history, ticker, cfg)
 
         try:
@@ -583,6 +656,7 @@ def process_ticker(ticker, direction, earnings_list, cfg,
             closes, volumes, hist_src = [], [], "timeout"
 
         executor.shutdown(wait=False)
+        quote_age_seconds = 0
 
         if is_etf and price <= 0:
             return {
@@ -590,24 +664,28 @@ def process_ticker(ticker, direction, earnings_list, cfg,
                 "score": 0.0, "_score_reason": "etf_no_price",
                 "options": {}, "news_direction": direction,
                 "is_etf": True, "etf_no_data": True,
-                "_src_quote": quote_src, "_closes_count": 0,
-                "rel_vol": "n/v", "unusual": False, "ma50": None, "ma20": None,
-                "above_ma50": None, "new_20d_high": None, "trend_status": "n/v",
+                "_src_quote": quote_src, "quote_age_seconds": quote_age_seconds,
+                "_closes_count": 0, "rel_vol": "n/v", "unusual": False,
+                "ma50": None, "ma20": None, "above_ma50": None,
+                "new_20d_high": None, "trend_status": "n/v",
                 "bullish": 50.0, "sent_fallback": True, "earnings_soon": False,
-                "_liquidity_fail": False, "_liquidity_reason": "",
+                "_data_quality_ok": False, "_data_quality_reason": "ETF ohne Preis",
+                "_liquidity_fail": True, "_liquidity_reason": "ETF ohne Preis",
+                "_no_trade_reason": "ETF ohne Preis",
             }
 
-        bullish, bearish, buzz, sent_fallback = get_sentiment(
-            ticker, change_pct, finnhub_key)
-        rel_vol       = calc_rel_volume(volumes)
-        unusual       = bool(rel_vol and rel_vol >= 1.5)
-        ma50          = calc_ma(closes, 50)
-        ma20          = calc_ma(closes, 20)
-        above_ma50    = (price > ma50) if (ma50 is not None and price > 0) else None
-        new_20d       = None
+        bullish, bearish, buzz, sent_fallback = get_sentiment(ticker, change_pct, finnhub_key)
+        rel_vol = calc_rel_volume(volumes)
+        # RelVol bleibt Diagnose. Es ist kein harter Alpha-Beweis, da keine Intraday-U-Kurve genutzt wird.
+        unusual = bool(rel_vol and rel_vol >= 1.5)
+        ma50 = calc_ma(closes, 50)
+        ma20 = calc_ma(closes, 20)
+        rv20 = calc_realized_volatility(closes)
+        above_ma50 = (price > ma50) if (ma50 is not None and price > 0) else None
+        new_20d = None
         if len(closes) >= 20 and price > 0:
             recent_high = max(closes[-20:])
-            new_20d     = price >= recent_high * 0.98 if recent_high > 0 else None
+            new_20d = price >= recent_high * 0.98 if recent_high > 0 else None
         earnings_soon = ticker in earnings_list
 
         score, score_reason = calculate_score(
@@ -624,51 +702,73 @@ def process_ticker(ticker, direction, earnings_list, cfg,
             closes=closes,
             rel_vol=rel_vol,
             signal_score=score,
+            earnings_soon=earnings_soon,
         )
 
-        # Harter Liquiditäts- und EV-Filter
+        market_stub = {"price": price, "_src_quote": quote_src, "quote_age_seconds": quote_age_seconds}
+        data_ok, data_reason = check_data_quality(market_stub, options_data)
         is_liquid, liquidity_reason = check_liquidity(options_data)
-        if not is_liquid:
-            logger.info("%s: Liquiditäts-Filter: %s", ticker, liquidity_reason)
-            score        = 0.0
-            score_reason = "liquidity_fail"
-        elif not options_data.get("ev_ok", False):
-            logger.info("%s: EV-Filter: EV%%=%s EV$=%s BE=%s%% expMove=%s%%",
-                        ticker, options_data.get("ev_pct"), options_data.get("ev_dollars"),
-                        options_data.get("breakeven_move_pct"), options_data.get("expected_move_pct"))
-            score        = 0.0
-            score_reason = "option_ev_fail"
-            is_liquid    = False
-            liquidity_reason = "Options-EV nach Kosten nicht ausreichend"
+        ev_ok = bool(options_data.get("ev_ok"))
 
-        logger.info("%s: price=%.2f score=%.1f liquid=%s ev=%s src=%s dte=%d",
-                    ticker, price, score, is_liquid, options_data.get("ev_pct"), quote_src, target_dte)
+        no_trade_reason = []
+        if not data_ok:
+            no_trade_reason.append(data_reason)
+        if not is_liquid:
+            no_trade_reason.append(liquidity_reason)
+        if not ev_ok:
+            no_trade_reason.append(options_data.get("ev_fail_reason") or "Options-EV nach Kosten nicht ausreichend")
+
+        if no_trade_reason:
+            if not data_ok:
+                score_reason = "data_quality_fail"
+            elif not is_liquid:
+                score_reason = "liquidity_fail"
+            else:
+                score_reason = "option_ev_fail"
+            score = 0.0
+
+        final_reason = merge_reasons(no_trade_reason)
+        if final_reason:
+            logger.info("%s: No-Trade-Gate: %s", ticker, final_reason)
+
+        logger.info(
+            "%s: price=%.2f score=%.1f data_ok=%s liquid=%s ev_ok=%s ev=%s src=%s dte=%d",
+            ticker, price, score, data_ok, is_liquid, ev_ok, options_data.get("ev_pct"), quote_src, target_dte
+        )
 
         return {
-            "ticker":           ticker,
-            "price":            price,
-            "change_pct":       change_pct,
-            "rel_vol":          str(rel_vol) if rel_vol is not None else "n/v",
-            "unusual":          unusual,
-            "ma50":             ma50,
-            "ma20":             ma20,
-            "above_ma50":       above_ma50,
-            "new_20d_high":     new_20d,
-            "trend_status":     ("über MA50" if above_ma50 is True
-                                 else ("unter MA50" if above_ma50 is False else "n/v")),
-            "bullish":          round(bullish, 1),
-            "sent_fallback":    sent_fallback,
-            "earnings_soon":    earnings_soon,
-            "score":            score,
-            "_score_reason":    score_reason,
-            "_liquidity_fail":  not is_liquid,
+            "ticker": ticker,
+            "price": price,
+            "change_pct": change_pct,
+            "rel_vol": str(rel_vol) if rel_vol is not None else "n/v",
+            "rel_vol_quality": "daily_only_no_intraday_curve",
+            "unusual": unusual,
+            "ma50": ma50,
+            "ma20": ma20,
+            "realized_vol_20d": round(rv20, 5) if rv20 else None,
+            "above_ma50": above_ma50,
+            "new_20d_high": new_20d,
+            "trend_status": ("über MA50" if above_ma50 is True
+                             else ("unter MA50" if above_ma50 is False else "n/v")),
+            "bullish": round(bullish, 1),
+            "bearish": round(bearish, 1),
+            "sentiment_rank_only": True,
+            "sent_fallback": sent_fallback,
+            "earnings_soon": earnings_soon,
+            "score": score,
+            "_score_reason": score_reason,
+            "_data_quality_ok": data_ok,
+            "_data_quality_reason": data_reason,
+            "_liquidity_fail": not is_liquid,
             "_liquidity_reason": liquidity_reason,
-            "options":          options_data,
-            "news_direction":   direction,
-            "is_etf":           is_etf,
-            "_src_quote":       quote_src,
-            "_src_hist":        hist_src,
-            "_closes_count":    len(closes),
+            "_no_trade_reason": final_reason,
+            "options": options_data,
+            "news_direction": direction,
+            "is_etf": is_etf,
+            "_src_quote": quote_src,
+            "quote_age_seconds": quote_age_seconds,
+            "_src_hist": hist_src,
+            "_closes_count": len(closes),
         }
 
     except Exception as e:
@@ -679,14 +779,16 @@ def process_ticker(ticker, direction, earnings_list, cfg,
             "ticker": ticker, "price": 0.0, "change_pct": 0.0,
             "score": 0.0, "_score_reason": "exception",
             "options": {}, "news_direction": direction,
-            "_src_quote": "error", "_closes_count": 0,
+            "_src_quote": "error", "quote_age_seconds": 0, "_closes_count": 0,
             "rel_vol": "n/v", "unusual": False, "ma50": None, "ma20": None,
             "above_ma50": None, "new_20d_high": None, "trend_status": "n/v",
-            "bullish": 40.0, "sent_fallback": True, "earnings_soon": False,
+            "bullish": 40.0, "bearish": 60.0, "sentiment_rank_only": True,
+            "sent_fallback": True, "earnings_soon": False,
+            "_data_quality_ok": False, "_data_quality_reason": "exception",
             "_liquidity_fail": True, "_liquidity_reason": "exception",
+            "_no_trade_reason": "exception",
             "_error": str(e)[:120],
         }
-
 
 # ══════════════════════════════════════════════════════════
 # SUMMARY BUILDER
@@ -694,62 +796,65 @@ def process_ticker(ticker, direction, earnings_list, cfg,
 
 def build_summary(ranked, vix_value, ticker_directions,
                   earnings_list, unusual_list, failed):
-    today    = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now().strftime("%Y-%m-%d")
     srcs_str = ", ".join(d["ticker"] + "=" + d.get("_src_quote","?") for d in ranked)
 
-    s  = "DATUM: " + today + "\n"
+    s = "DATUM: " + today + "\n"
     s += "VIX: " + str(vix_value) + "\n"
     s += "NEWS-SIGNALE: " + (
         ", ".join(t + ":" + d for t, d in ticker_directions.items()) or "keine") + "\n"
     s += "EARNINGS NAECHSTE 10 TAGE: " + (
         ", ".join(earnings_list) if earnings_list else "Keine") + "\n"
-    s += "UNUSUAL ACTIVITY (RelVol >= 1.5x): " + (
-        ", ".join(unusual_list) or "Keiner") + "\n"
+    s += "UNUSUAL ACTIVITY: nur Diagnose; keine lineare Intraday-Extrapolation\n"
     s += "TOP 3: " + ", ".join(d["ticker"] for d in ranked[:3]) + "\n"
     s += "QUOTE-QUELLEN: " + srcs_str + "\n"
     if failed:
         s += "API-FEHLER (Kurs=0): " + ", ".join(failed) + "\n"
 
+    s += "\nHARTE GATES: DATA_QUALITY_OK, LIQUIDITY_OK, EV_OK, EARNINGS_IV_OK muessen alle True sein.\n"
+    s += "SENTIMENT: nur Ranking-/Kontextinfo, kein EV-Retter.\n"
+
     s += "\nMARKTDATEN (sortiert nach Score):\n"
     s += (f"{'Ticker':<6} | {'Kurs':>7} | {'Δ%':>6} | {'MA50':>7} | "
-          f"{'Trend':<14} | {'20dH':<5} | {'RelVol':>7} | {'News':>5} | "
-          f"{'Bull%':>6} | {'Score':>6}\n" + "-" * 110 + "\n")
+          f"{'Trend':<14} | {'RelVol':>7} | {'News':>5} | {'Score':>6} | {'Gate':<4}\n" + "-" * 118 + "\n")
 
     for d in ranked:
         if d.get("etf_no_data"):
             s += (d["ticker"].ljust(6) + " | ETF-SIGNAL | Richtung: " +
-                  d["news_direction"] + " | Score: 0\n")
+                  d["news_direction"] + " | Score: 0 | NO_TRADE: " + d.get("_no_trade_reason", "n/v") + "\n")
             continue
 
         news_flag = ("📈" if d["news_direction"] == "CALL" else "📉") + d["news_direction"]
-        kurs_str  = f"{d['price']:>7.2f}" if d["price"] > 0 else "   n/v!"
-        high_str  = ("JA" if d.get("new_20d_high") is True
-                     else ("nein" if d.get("new_20d_high") is False else "n/v"))
-        liq_flag  = " ⛔" if d.get("_liquidity_fail") else ""
+        kurs_str = f"{d['price']:>7.2f}" if d["price"] > 0 else "   n/v!"
+        gate_ok = bool(d.get("_data_quality_ok")) and not d.get("_liquidity_fail") and bool(d.get("options", {}).get("ev_ok"))
+        gate_flag = "OK" if gate_ok else "FAIL"
 
         s += (f"{d['ticker']:<6} | {kurs_str} | {d['change_pct']:>6.2f}% | "
               f"{str(d.get('ma50','n/v')):>7} | {d.get('trend_status','n/v'):<14} | "
-              f"{high_str:<5} | {str(d['rel_vol']):>6}{'🔥' if d.get('unusual') else ''} | "
-              f"{news_flag:>5} | {d['bullish']:>6.1f}% | "
-              f"{d['score']:>6.2f}{liq_flag}\n")
+              f"{str(d['rel_vol']):>6}{'🔥' if d.get('unusual') else ''} | "
+              f"{news_flag:>5} | {d['score']:>6.2f} | {gate_flag:<4}\n")
 
-        if d.get("_liquidity_fail") and d.get("_liquidity_reason"):
-            s += "  ⛔ LIQUIDITÄT: " + d["_liquidity_reason"] + "\n"
-        elif d.get("options"):
-            opt = d["options"]
+        if d.get("_no_trade_reason"):
+            s += "  ⛔ NO_TRADE_REASON: " + d["_no_trade_reason"] + "\n"
+
+        opt = d.get("options") or {}
+        if opt:
             s += ("  └─ OPTIONS: Strike=" + str(opt.get("strike","n/v")) +
                   " | Exp=" + str(opt.get("expiration","n/v")) +
                   " | Bid=" + str(opt.get("bid","n/v")) +
                   "/Ask=" + str(opt.get("ask","n/v")) +
                   " | Mid=" + str(opt.get("midpoint","n/v")) +
                   " | Entry=" + str(opt.get("conservative_entry","n/v")) +
+                  " | ExitSlip=" + str(opt.get("exit_slippage_points","n/v")) +
                   " | Delta=" + str(opt.get("delta","n/v")) +
                   " | IV=" + str(opt.get("iv","n/v")) + "%" +
+                  " | IV/RV=" + str(opt.get("iv_to_rv","n/v")) +
                   " | OI=" + str(opt.get("open_interest","n/v")) +
                   " | FillP=" + str(opt.get("fill_probability","n/v")) +
                   " | EV%=" + str(opt.get("ev_pct","n/v")) +
                   " | EV$=" + str(opt.get("ev_dollars","n/v")) +
-                  " | EV_OK=" + str(opt.get("ev_ok", False)) + "\n")
+                  " | EV_OK=" + str(opt.get("ev_ok", False)) +
+                  " | EARN_IV_OK=" + str(opt.get("earnings_iv_ok", True)) + "\n")
 
     s += "\nSENTIMENT-FALLBACK: " + (
         ", ".join(d["ticker"] for d in ranked if d.get("sent_fallback")) or "keiner"
