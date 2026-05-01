@@ -23,8 +23,12 @@ from news_utils import article_fingerprint, canonicalize_url, near_duplicate_key
 logger = logging.getLogger(__name__)
 
 # Optionale finBERT Integration — Fail-safe
+# Wichtig: finbert_sentiment.py lädt das Modell lazy. Das dortige
+# FINBERT_AVAILABLE ist beim Import noch False; deshalb hier nur prüfen,
+# ob die Funktion importierbar ist.
 try:
-    from finbert_sentiment import get_finbert_sentiment_batch, FINBERT_AVAILABLE
+    from finbert_sentiment import get_finbert_sentiment_batch
+    FINBERT_AVAILABLE = True
 except ImportError:
     FINBERT_AVAILABLE = False
     def get_finbert_sentiment_batch(texts):
@@ -114,6 +118,15 @@ DEFAULT_TICKERS = {
 
 # Dynamisch aus Nasdaq Trader; Fallback bleibt die bisherige Liste.
 KNOWN_TICKERS = get_known_tickers(DEFAULT_TICKERS)
+
+# Dynamisches Universe erhöht Recall, erzeugt aber auch False Positives:
+# "AI" ist oft nur das Thema Artificial Intelligence, nicht C3.ai;
+# "EQR" kann z. B. ASX:EQ Resources sein, während Tradier EQR=Equity Residential liefert.
+AMBIGUOUS_TICKERS = {
+    "AI", "CEO", "CFO", "COO", "FDA", "SEC", "IPO", "ETF", "EPS", "GDP",
+    "EV", "PE", "US", "USA", "UK", "EU"
+}
+CORE_TICKERS = set(DEFAULT_TICKERS)
 
 TICKER_ALIASES = {
     "J&J": "JNJ", "Johnson & Johnson": "JNJ",
@@ -287,6 +300,73 @@ def parse_pub_date(date_str: str) -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _has_ticker_context(symbol: str, text: str, text_low: str) -> bool:
+    """Schützt gegen False Positives durch dynamisches Universe.
+
+    Regeln:
+    - Core-Ticker/ETFs bleiben erlaubt.
+    - Dynamische Ticker brauchen Cashtag/Exchange/Stock-Kontext.
+    - Sehr mehrdeutige Symbole brauchen spezifischen Kontext.
+    """
+    sym = symbol.upper()
+
+    if sym == "AI":
+        return any(k in text_low for k in ("c3.ai", "c3 ai", "nyse: ai", "$ai", " ai stock", " ai shares"))
+
+    if sym == "EQR" and "eq resources" in text_low:
+        return False
+
+    if sym in CORE_TICKERS:
+        return True
+
+    if re.search(rf"\${sym}\b", text):
+        return True
+    if re.search(rf"\b(NYSE|NASDAQ|AMEX|ARCA)\s*[:\-]?\s*{sym}\b", text, re.IGNORECASE):
+        return True
+    if re.search(rf"\b{sym}\s+(stock|shares|options|calls|puts|earnings|upgrade|downgrade|price target)\b", text, re.IGNORECASE):
+        return True
+    if re.search(rf"\b(stock|shares|options|calls|puts)\s+(of|in)?\s*{sym}\b", text, re.IGNORECASE):
+        return True
+
+    return False
+
+
+def extract_tickers_from_text(title: str, summary: str = "") -> list[str]:
+    """Ticker-Extraktion mit False-Positive-Guards.
+
+    Das dynamische Nasdaq-Universe bleibt nutzbar, aber nicht jedes
+    Großbuchstabenwort wird als US-Equity gewertet.
+    """
+    text = f"{title} {summary}"
+    text_low = text.lower()
+    found: list[str] = []
+
+    # 1) Explizite Firmen-Aliase sind am zuverlässigsten.
+    for alias, sym in TICKER_ALIASES.items():
+        if alias.lower() in text_low and sym not in found:
+            found.append(sym)
+
+    # 2) Explizite Cashtags / Exchange-Muster.
+    explicit = set()
+    explicit.update(m.group(1).upper() for m in re.finditer(r"\$([A-Z]{1,5})\b", text))
+    explicit.update(m.group(2).upper() for m in re.finditer(r"\b(NYSE|NASDAQ|AMEX|ARCA)\s*[:\-]?\s*([A-Z]{1,5})\b", text, re.IGNORECASE))
+    for sym in explicit:
+        if sym in KNOWN_TICKERS and sym not in found:
+            found.append(sym)
+
+    # 3) Großbuchstaben-Kandidaten, aber mit Kontextfilter.
+    for sym in TICKER_PATTERN.findall(text):
+        sym = sym.upper()
+        if sym not in KNOWN_TICKERS or sym in found:
+            continue
+        if sym in AMBIGUOUS_TICKERS and not _has_ticker_context(sym, text, text_low):
+            continue
+        if _has_ticker_context(sym, text, text_low):
+            found.append(sym)
+
+    return found[:5]
+
+
 # ══════════════════════════════════════════════════════════
 # RSS FETCH
 # ══════════════════════════════════════════════════════════
@@ -315,11 +395,7 @@ def fetch_one_feed(feed: dict) -> list:
                 if kw in text_lower:
                     kw_score += weight
                     detected.append(kw)
-            tickers = [t for t in TICKER_PATTERN.findall(title + " " + summary)
-                       if t in KNOWN_TICKERS]
-            for alias, sym in TICKER_ALIASES.items():
-                if alias.lower() in (title + " " + summary).lower() and sym not in tickers:
-                    tickers.append(sym)
+            tickers = extract_tickers_from_text(title, summary)
             result.append({
                 "hash":         article_fingerprint(title, link, summary),
                 "dedupe_key":   near_duplicate_key(title),
@@ -490,8 +566,10 @@ def cluster_articles(articles: list, earnings_map: dict) -> list:
         if top_headlines:
             try:
                 finbert_scores = get_finbert_sentiment_batch(top_headlines)
+                used = 0
                 for cluster, fb_score in zip(top_clusters, finbert_scores):
                     if fb_score != 0.0:
+                        used += 1
                         old_conf = cluster["confidence_score"]
                         old_mult = cluster.get("sentiment_mult", 1.0)
                         cluster["sentiment_score"]  = fb_score
@@ -503,11 +581,14 @@ def cluster_articles(articles: list, earnings_map: dict) -> list:
                             cluster["confidence_score"] = round(
                                 old_conf / old_mult * new_mult, 2
                             )
-                logger.info("finBERT: %d Top-Cluster analysiert", len(top_headlines))
+                if used:
+                    logger.info("finBERT: %d/%d Top-Cluster analysiert", used, len(top_headlines))
+                else:
+                    logger.debug("finBERT ohne verwertbaren Score — Keyword-Sentiment bleibt aktiv")
             except Exception as e:
                 logger.warning("finBERT Cluster-Update fehlgeschlagen: %s", e)
     else:
-        logger.debug("finBERT nicht verfügbar — Keyword-Sentiment aktiv")
+        logger.debug("finBERT nicht importierbar — Keyword-Sentiment aktiv")
 
     # Nach finBERT neu sortieren
     result.sort(key=lambda x: x["confidence_score"], reverse=True)
@@ -535,6 +616,81 @@ def format_clusters_for_claude(clusters: list) -> str:
             ' | HEADLINE:"' + c["headline_repr"] + '"'
         )
     return "\n---\n".join(lines)
+
+
+def _signals_from_prose(raw: str) -> str | None:
+    """Extrahiert Signale aus Claude-Prosa wie:
+    **USO (Iran war)** ... → CALL on USO
+    **EQR_acquisition** ... → PUT signal
+    """
+    if not raw:
+        return None
+
+    macro_tickers = {"SPY", "QQQ", "TLT", "USO", "GLD", "UUP", "XLE", "XLF", "IWM"}
+    rows = []
+    seen = set()
+
+    for line in raw.splitlines():
+        line_clean = line.strip()
+        if not line_clean:
+            continue
+        low = line_clean.lower()
+        if any(k in low for k in ("skip", "marginal", "unclear", "no signal")):
+            continue
+
+        direction = None
+        if re.search(r"(→|->|=>)\s*PUT\b|\bPUT\s+signal\b|\bPUT\s+on\b", line_clean, re.IGNORECASE):
+            direction = "PUT"
+        elif re.search(r"(→|->|=>)\s*CALL\b|\bCALL\s+signal\b|\bCALL\s+on\b", line_clean, re.IGNORECASE):
+            direction = "CALL"
+        if not direction:
+            continue
+
+        ticker = None
+        # Preferiere "CALL on USO" / "PUT on TLT".
+        m = re.search(r"\b(?:CALL|PUT)\s+on\s+([A-Z]{1,5})\b", line_clean)
+        if m and m.group(1).upper() in KNOWN_TICKERS:
+            ticker = m.group(1).upper()
+
+        # Dann Markdown-Clusterkopf: **EQR_acquisition** oder **USO (Iran war)**.
+        if not ticker:
+            m = re.search(r"\*\*\s*([A-Z]{1,5})(?:[_\s\(\-]|\*\*)", line_clean)
+            if m and m.group(1).upper() in KNOWN_TICKERS:
+                ticker = m.group(1).upper()
+
+        if not ticker:
+            candidates = [
+                t for t in TICKER_PATTERN.findall(line_clean)
+                if t in KNOWN_TICKERS and t not in {"CALL", "PUT", "HIGH", "MED", "LOW"}
+            ]
+            if candidates:
+                ticker = candidates[0].upper()
+
+        if not ticker or ticker in seen:
+            continue
+
+        conf = 2.0
+        m = re.search(r"CONFIDENCE\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", line_clean, re.IGNORECASE)
+        if m:
+            try:
+                conf = float(m.group(1))
+            except ValueError:
+                pass
+
+        score = _score_bucket(conf)
+        is_macro = ticker in macro_tickers or any(k in low for k in ("fed", "oil", "gold", "iran", "hormuz", "war", "tariff", "china"))
+        horizon = "T3" if is_macro else "T1"
+        dte_days = 45 if is_macro else 21
+
+        rows.append((conf, ticker, direction, score, horizon, dte_days))
+        seen.add(ticker)
+
+    if not rows:
+        return None
+
+    rows.sort(reverse=True, key=lambda x: x[0])
+    parts = [f"{ticker}:{direction}:{score}:{horizon}:{dte_days}DTE" for conf, ticker, direction, score, horizon, dte_days in rows[:5]]
+    return "TICKER_SIGNALS:" + ",".join(parts)
 
 
 def _canonical_signal_line(raw: str) -> str | None:
@@ -585,6 +741,10 @@ def _canonical_signal_line(raw: str) -> str | None:
             if cleaned.startswith("TICKER_SIGNALS:") and cleaned != "TICKER_SIGNALS:":
                 return cleaned
 
+    prose_line = _signals_from_prose(text)
+    if prose_line:
+        return prose_line
+
     return None
 
 
@@ -617,11 +777,21 @@ def _infer_direction_from_cluster(ticker: str, event_type: str, headline: str, s
     text = f"{event_type} {headline}".lower()
     ticker = ticker.upper()
 
+    # "AI" ist oft nur ein Thema, nicht das US-Ticker-Symbol C3.ai.
+    if ticker == "AI" and not any(k in text for k in ("c3.ai", "c3 ai", "nyse: ai", "$ai", " ai stock", " ai shares")):
+        return None
+
+    if ticker == "EQR" and "eq resources" in text:
+        return None
+
     bearish_terms = (
         "miss", "misses", "downgrade", "downgraded", "recall", "bankruptcy",
         "default", "investigation", "warning", "guidance cut", "plunge",
         "collapse", "layoffs", "fraud", "lawsuit", "probe", "tariff",
         "trade war", "china risk", "recession", "crisis",
+        "walks away", "walk away", "abandons", "abandoned", "terminates",
+        "terminated", "withdraws", "withdrawn", "deal collapses",
+        "deal collapse", "breaks off", "falls through",
     )
     bullish_terms = (
         "beat", "beats", "upgrade", "upgraded", "approval", "approved",
