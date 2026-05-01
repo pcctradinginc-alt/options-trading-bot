@@ -513,6 +513,45 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
         "contracts": None,
     }
 
+
+def enrich_with_journal_iv_rank(symbol: str, option_ev: dict) -> dict:
+    """
+    Nutzt ausschließlich die eigene Journal-IV-Historie.
+    Wenn zu wenig Historie existiert, wird nicht blockiert, sondern diagnostiziert.
+    """
+    try:
+        from trading_journal import get_iv_stats
+        stats = get_iv_stats(symbol, option_ev.get("iv_decimal"), min_samples=2)
+    except Exception as exc:
+        stats = {
+            "iv_rank": None,
+            "iv_percentile": None,
+            "iv_history_count": 0,
+            "iv_rank_reason": "IV-Rank nicht berechenbar: " + str(exc)[:80],
+        }
+
+    option_ev.update(stats)
+    n = int(stats.get("iv_history_count") or 0)
+    iv_rank = stats.get("iv_rank")
+    iv_percentile = stats.get("iv_percentile")
+
+    # Hartes Gate erst bei ausreichend eigener Historie. Vorher nur Diagnose.
+    if n >= RULES.min_iv_history_samples_for_rank:
+        if iv_rank is not None and iv_rank >= RULES.iv_rank_hard_block_long:
+            option_ev["ev_ok"] = False
+            option_ev["ev_fail_reason"] = merge_reasons(
+                option_ev.get("ev_fail_reason"),
+                f"IV-Rank {iv_rank:.1f} >= {RULES.iv_rank_hard_block_long:.1f} Long-Option zu teuer",
+            )
+        if iv_percentile is not None and iv_percentile >= RULES.iv_percentile_hard_block_long:
+            option_ev["ev_ok"] = False
+            option_ev["ev_fail_reason"] = merge_reasons(
+                option_ev.get("ev_fail_reason"),
+                f"IV-Percentile {iv_percentile:.1f} >= {RULES.iv_percentile_hard_block_long:.1f}",
+            )
+    return option_ev
+
+
 # ══════════════════════════════════════════════════════════
 # TRADIER OPTIONS
 # ══════════════════════════════════════════════════════════
@@ -542,7 +581,7 @@ def get_tradier_options(symbol, direction, tradier_token,
         target_days = None
         for exp in exps:
             days = (datetime.strptime(exp, "%Y-%m-%d") - today_dt).days
-            if days < 7:
+            if days < RULES.min_dte_days:
                 continue
             diff = abs(days - target_dte)
             if diff < best_diff:
@@ -598,6 +637,7 @@ def get_tradier_options(symbol, direction, tradier_token,
         best = sorted(chosen_pool, key=lambda c: c.get("ev_score", -999), reverse=True)[0]
         best["candidate_count"] = len(candidates)
         best["ev_candidates_ok"] = len(good)
+        best = enrich_with_journal_iv_rank(symbol, best)
         if not best.get("ev_ok") and not best.get("ev_fail_reason"):
             best["ev_fail_reason"] = "Kein Kandidat nach EV/Kosten/Earnings-Gates"
         return best
@@ -735,7 +775,7 @@ def process_ticker(ticker, direction, earnings_list, cfg,
 
         rel_vol = calc_rel_volume(volumes)
         # RelVol bleibt Diagnose. Es ist kein harter Alpha-Beweis, da keine Intraday-U-Kurve genutzt wird.
-        unusual = bool(rel_vol and rel_vol >= 1.5)
+        unusual = bool(rel_vol and rel_vol >= RULES.daily_rvol_unusual_threshold)
         ma50 = calc_ma(closes, 50)
         ma20 = calc_ma(closes, 20)
         rv20 = calc_realized_volatility(closes)
@@ -935,6 +975,9 @@ def build_summary(ranked, vix_value, ticker_directions,
                   " | Delta=" + str(opt.get("delta","n/v")) +
                   " | IV=" + str(opt.get("iv","n/v")) + "%" +
                   " | IV/RV=" + str(opt.get("iv_to_rv","n/v")) +
+                  " | IVRank=" + str(opt.get("iv_rank","n/v")) +
+                  " | IVPct=" + str(opt.get("iv_percentile","n/v")) +
+                  " | IVHist=" + str(opt.get("iv_history_count","n/v")) +
                   " | OI=" + str(opt.get("open_interest","n/v")) +
                   " | FillP=" + str(opt.get("fill_probability","n/v")) +
                   " | EV%=" + str(opt.get("ev_pct","n/v")) +
