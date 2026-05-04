@@ -23,8 +23,15 @@ except ImportError:
     get_known_tickers = None
     STATIC_ETFS = {"SPY", "QQQ", "IWM", "DIA", "GLD", "SLV", "USO", "TLT"}
 
-# Wird beim ersten Aufruf von cluster_articles() gefüllt (Lazy-Load)
+# Firmenname -> Ticker, für Headlines wie "Apple reports earnings"
+try:
+    from sec_check import get_company_name_to_ticker
+except ImportError:
+    get_company_name_to_ticker = None
+
+# Werden beim ersten Aufruf von cluster_articles() gefüllt (Lazy-Load)
 _KNOWN_TICKERS_CACHE: set[str] | None = None
+_NAME_TO_TICKER_CACHE: dict[str, str] | None = None
 
 logger = logging.getLogger(__name__)
 
@@ -136,40 +143,88 @@ def _load_known_tickers() -> set[str]:
     return _KNOWN_TICKERS_CACHE
 
 
+def _load_name_to_ticker() -> dict[str, str]:
+    """Lädt das Firmenname->Ticker-Mapping einmal pro Run (Lazy + Cache)."""
+    global _NAME_TO_TICKER_CACHE
+    if _NAME_TO_TICKER_CACHE is not None:
+        return _NAME_TO_TICKER_CACHE
+
+    if get_company_name_to_ticker is not None:
+        try:
+            _NAME_TO_TICKER_CACHE = get_company_name_to_ticker()
+            return _NAME_TO_TICKER_CACHE
+        except Exception as e:
+            logger.warning("Name->Ticker Mapping nicht verfügbar: %s", e)
+
+    _NAME_TO_TICKER_CACHE = {}
+    return _NAME_TO_TICKER_CACHE
+
+
+def _resolve_ticker_from_headline(
+    title: str,
+    known_tickers: set[str],
+    name_map: dict[str, str],
+    seen: set[str],
+) -> str | None:
+    """Versucht, einen Ticker aus der Headline zu extrahieren.
+    Reihenfolge: 1) direkter Ticker im Originaltext, 2) Firmenname.
+    """
+    # 1) Direkter Ticker — im Originaltext groß geschrieben
+    for word in title.split():
+        clean = word.strip(".,:;()[]{}'\"")
+        if (clean.isupper()
+                and 2 <= len(clean) <= 5
+                and clean.isalpha()
+                and clean in known_tickers
+                and clean not in seen):
+            return clean
+
+    # 2) Firmenname — längste Übereinstimmung gewinnt.
+    # Normalisierung muss zu sec_check._normalize_company_name passen
+    # (lowercase, & -> "and", nur Buchstaben/Ziffern/Bindestrich)
+    if not name_map:
+        return None
+    title_lower = title.lower().replace("&", " and ")
+    title_lower = re.sub(r"[^a-z0-9\s\-]", " ", title_lower)
+    title_lower = re.sub(r"\s+", " ", title_lower)
+    title_lower = " " + title_lower.strip() + " "
+
+    best_ticker = None
+    best_len = 0
+    for name, ticker in name_map.items():
+        if ticker in seen:
+            continue
+        # Word-Boundary-Check, damit "apple" nicht in "pineapple" matcht
+        if f" {name} " in title_lower and len(name) > best_len:
+            best_ticker = ticker
+            best_len = len(name)
+
+    return best_ticker
+
+
 def cluster_articles(articles: List[Dict], earnings_map: Dict) -> List[Dict]:
     """Gruppiert News und erkennt Ticker sowie Earnings-Events.
 
-    Ein Wort gilt nur dann als Ticker, wenn es:
-      1. im Originaltext bereits komplett groß geschrieben war (kein .upper()-Trick),
-      2. 2-5 Buchstaben lang ist (rein alphabetisch),
-      3. im handelbaren Ticker-Universum (Nasdaq + ETFs) vorkommt.
-    Cluster ohne erkannten Ticker werden verworfen.
+    Ticker-Erkennung in zwei Stufen:
+      1. Direkter Ticker in Headline ("AAPL beats Q4...")
+      2. Firmenname in Headline ("Apple reports record earnings")
+    Cluster ohne erkennbaren Ticker werden verworfen.
     """
     known_tickers = _load_known_tickers()
+    name_map = _load_name_to_ticker()
     clusters = []
     seen = set()
 
     for art in articles:
         original_title = art["title"]
-        title_upper = original_title.upper()  # nur für Earnings-Keyword-Suche
-        ticker = None
+        title_upper = original_title.upper()  # für Earnings-Keyword-Suche
 
-        # Ticker NUR im Originaltext suchen — title.upper() würde alles matchen
-        for word in original_title.split():
-            clean = word.strip(".,:;()[]{}'\"")
-            if (clean.isupper()
-                    and 2 <= len(clean) <= 5
-                    and clean.isalpha()
-                    and clean in known_tickers
-                    and clean not in seen):
-                ticker = clean
-                break
-
-        # Cluster ohne erkennbaren Ticker nicht in den Report aufnehmen
+        ticker = _resolve_ticker_from_headline(
+            original_title, known_tickers, name_map, seen
+        )
         if ticker is None:
             continue
 
-        # Keyword-basierte Earnings-Erkennung
         is_earnings = any(kw in title_upper for kw in
                           ["EARNINGS", "BEAT", "MISS", "REPORT", "RESULTS",
                            "Q1", "Q2", "Q3", "Q4"])
