@@ -19,7 +19,7 @@ from market_data import (
 )
 from report_generator import call_claude, build_html, send_email
 from rules import parse_ticker_signals, RULES
-from simple_journal import journal   # ← Wrapper
+from simple_journal import journal
 
 
 def setup_logging(verbose: bool) -> None:
@@ -39,28 +39,37 @@ logger = logging.getLogger(__name__)
 # ====================== HTML HELPER ======================
 def _no_trade_html(today: str, vix=None, market_status: str = "",
                    clusters: list = None, reason: str = "Kein valides Signal") -> str:
-    """Kopiert aus Original"""
     vix_str = str(vix) if vix and vix != "n/v" else "n/v"
     status_str = market_status or "unbekannt"
     clusters = clusters or []
 
-    # ... (hier kommt der komplette HTML-Code aus deiner ursprünglichen _no_trade_html Funktion)
-    # Ich kürze hier aus Platzgründen. Kopiere den gesamten Body aus deiner alten main.py
+    cluster_rows = ""
+    for c in clusters[:5]:
+        conf = c.get("confidence_score", 0)
+        tick = c.get("ticker", "?")
+        head = c.get("headline_repr", "")[:60]
+        sent = c.get("sentiment_score", 0)
+        src = c.get("sentiment_source", "keyword")
+        sent_icon = "📈" if sent > 0.1 else ("📉" if sent < -0.1 else "➖")
+        src_badge = "🤖" if src == "finbert" else "🔤"
+        cluster_rows += f'<tr><td style="padding:6px 8px;font-weight:600;">{tick}</td>' \
+                        f'<td style="padding:6px 8px;text-align:center;">{conf:.2f}</td>' \
+                        f'<td style="padding:6px 8px;text-align:center;">{sent_icon}{src_badge}</td>' \
+                        f'<td style="padding:6px 8px;color:#86868b;">{head}</td></tr>'
 
-    return """<html><head><meta charset="UTF-8">...</html>"""  # ← Vollständigen Code hier einfügen!
+    cluster_section = f'<div style="margin-top:20px;">... {cluster_rows} ...</div>' if cluster_rows else ""
+
+    return f'''<html><head><meta charset="UTF-8"></head><body style="background:#f5f5f7;">
+    <div style="max-width:520px;margin:0 auto;padding:32px 16px;background:white;border-radius:18px;">
+        <h2>Daily Options Report — {today}</h2>
+        <h3 style="color:#ff3b30;">Heute kein Trade</h3>
+        <p>VIX: {vix_str} | Grund: {reason}</p>
+        {cluster_section}
+    </div></body></html>'''
 
 
 def _error_html(error: str, today: str) -> str:
-    """Kopiert aus Original"""
-    return (
-        '<html><head><meta charset="UTF-8"></head>'
-        '<body style="font-family:-apple-system,sans-serif;background:#f5f5f7;padding:40px;text-align:center;">'
-        '<div style="background:white;border-radius:18px;padding:32px;max-width:400px;margin:0 auto;">'
-        f'<div style="font-size:40px;margin-bottom:16px;">⚠️</div>'
-        f'<h2>Daily Options Report — Fehler</h2>'
-        f'<p style="color:#86868b;">{error}</p>'
-        '</div></body></html>'
-    )
+    return f'<html><body><h2>Fehler am {today}</h2><p>{error}</p></body></html>'
 
 
 def _send_or_save(html: str, subject: str, cfg: dict, dry_run: bool) -> None:
@@ -100,27 +109,31 @@ def main() -> int:
     today = datetime.now().strftime("%d.%m.%Y")
     t_start = time.monotonic()
 
-    # Journal Run starten
     journal.start_run()
-    logger.info("=" * 60)
+    logger.info("=" * 70)
     logger.info("Daily Options Report — %s (Run ID: %s)", today, journal.get_run_id())
-    logger.info("=" * 60)
+    logger.info("=" * 70)
 
     try:
         journal.update_outcomes(cfg)
     except Exception as e:
         logger.warning("Outcome-Update übersprungen: %s", e)
 
-    # === STEP 1: News ===
+    # STEP 1: News
     logger.info("[1/3] News-Analyse...")
+    t1 = time.monotonic()
     articles = fetch_all_feeds()
     earnings_map = build_earnings_map(cfg.get("finnhub_key", ""))
     clusters = cluster_articles(articles, earnings_map)
     cluster_text = format_clusters_for_claude(clusters)
     market_time, market_status = get_market_context()
 
-    ticker_signals = run_claude(cluster_text, market_time, market_status, cfg.get("anthropic_api_key", ""))
+    ticker_signals = run_claude(
+        cluster_text, market_time, market_status, cfg.get("anthropic_api_key", "")
+    )
     vix_value = get_vix()
+
+    logger.info("Claude Signal: %s | VIX: %s", ticker_signals[:100], vix_value)
 
     if ticker_signals in ("TICKER_SIGNALS:NONE", "", None):
         data = {"no_trade": True, "no_trade_grund": "Kein valides Signal", "vix": vix_value}
@@ -129,30 +142,82 @@ def main() -> int:
         _send_or_save(html, f"⏸️ Daily Options Report – Kein Trade – {today}", cfg, args.dry_run)
         return 0
 
-    # === STEP 2: Marktdaten ===
+    # STEP 2: Marktdaten
     logger.info("[2/3] Marktdaten...")
+    t2 = time.monotonic()
+
     parsed_signals = parse_ticker_signals(ticker_signals)
-    # ... Hier kommt dein kompletter Step-2 Code (process_ticker, ThreadPool etc.) ...
+    if not parsed_signals:
+        logger.error("Keine gültigen Ticker geparst")
+        return 1
 
-    market_data = [...]   # ← Deine Verarbeitung hier einfügen
+    ticker_directions = {s["ticker"]: s["direction"] for s in parsed_signals}
+    tickers = list(ticker_directions.keys())
+    dte_map = {s["ticker"]: s["dte_days"] for s in parsed_signals}
 
+    # Earnings
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        earnings_fut = ex.submit(get_earnings,
+                                 datetime.now().strftime("%Y-%m-%d"),
+                                 (datetime.now() + timedelta(days=10)).strftime("%Y-%m-%d"),
+                                 cfg.get("finnhub_key", ""))
+        earnings_list = earnings_fut.result(timeout=15)
+
+    # Ticker verarbeiten
+    with ThreadPoolExecutor(max_workers=RULES.max_tickers) as ex:
+        futures = {
+            ex.submit(process_ticker, t, ticker_directions[t], earnings_list, cfg, dte_map.get(t, 21)): t
+            for t in tickers
+        }
+        results = []
+        for f in as_completed(futures, timeout=45):
+            try:
+                results.append(f.result())
+            except Exception as e:
+                logger.error("Ticker %s fehlgeschlagen: %s", futures[f], e)
+
+    market_data = [r for r in results if r]
+    _enrich_market_data_with_cluster_context(market_data, clusters)
+
+    # === WICHTIG: Journalisieren ===
     journal.log_signals(parsed_signals, market_data, clusters)
 
-    # ... Ranking, Gates, No-Trade Prüfung ...
+    ranked = sorted(market_data, key=lambda x: x.get("score", 0), reverse=True)
 
-    # === STEP 3: Report ===
+    logger.info("Marktdaten fertig (%.1fs) — %d valide Ticker", time.monotonic() - t2, len(market_data))
+
+    # No-Trade Check
+    if not any(
+        d.get("score", 0) >= RULES.min_score and
+        d.get("_data_quality_ok", False) and
+        d.get("options", {}).get("ev_ok", False)
+        for d in ranked
+    ):
+        data = {"no_trade": True, "no_trade_grund": "Keine qualifizierten Trades", "vix": vix_value}
+        journal.log_decision(data)
+        html = _no_trade_html(today, vix_value, market_status, clusters[:3], "Keine qualifizierten Trades")
+        _send_or_save(html, f"⏸️ Daily Options Report – No Trade – {today}", cfg, args.dry_run)
+        return 0
+
+    # STEP 3: Report
+    logger.info("[3/3] Report generieren...")
     try:
-        data = call_claude(build_summary(...), cfg.get("anthropic_api_key", ""), vix_direct=vix_value)
+        market_summary = build_summary(ranked, vix_value, ticker_directions, earnings_list, [], [])
+        data = call_claude(market_summary, cfg.get("anthropic_api_key", ""), vix_direct=vix_value)
         journal.log_decision(data)
-        html_report = build_html(data, today)
-        # ... Email-Versand ...
-    except Exception as e:
-        logger.error("Report Fehler: %s", e)
-        data = {"no_trade": True, "no_trade_grund": f"Report-Fehler: {e}"}
-        journal.log_decision(data)
-        html_report = _error_html(str(e), today)
-        _send_or_save(html_report, f"⚠️ Daily Options Report – Fehler – {today}", cfg, args.dry_run)
 
+        html_report = build_html(data, today)
+        no_trade = data.get("no_trade", False)
+        ticker = data.get("ticker", "")
+        subject = f"⏸️ No Trade – {today}" if no_trade else f"📊 {ticker} – {today}"
+        _send_or_save(html_report, subject, cfg, args.dry_run)
+    except Exception as e:
+        logger.error("Report-Fehler: %s", e)
+        data = {"no_trade": True, "no_trade_grund": f"Report Fehler: {e}"}
+        journal.log_decision(data)
+        _send_or_save(_error_html(str(e), today), f"⚠️ Report Fehler – {today}", cfg, args.dry_run)
+
+    logger.info("✅ Gesamtlauf beendet in %.1fs", time.monotonic() - t_start)
     return 0
 
 
