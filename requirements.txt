@@ -4,3 +4,4 @@ transformers>=4.40.0
 torch>=2.2.0
 exchange_calendars>=4.5.0
 pydantic>=2.7.0
+feedparser>=6.0.10
