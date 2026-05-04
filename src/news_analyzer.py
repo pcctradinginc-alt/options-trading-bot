@@ -25,9 +25,10 @@ except ImportError:
 
 # Firmenname -> Ticker, für Headlines wie "Apple reports earnings"
 try:
-    from sec_check import get_company_name_to_ticker
+    from sec_check import get_company_name_to_ticker, COMPANY_NAME_OVERRIDES
 except ImportError:
     get_company_name_to_ticker = None
+    COMPANY_NAME_OVERRIDES = {}
 
 # Werden beim ersten Aufruf von cluster_articles() gefüllt (Lazy-Load)
 _KNOWN_TICKERS_CACHE: set[str] | None = None
@@ -164,10 +165,17 @@ def _resolve_ticker_from_headline(
     title: str,
     known_tickers: set[str],
     name_map: dict[str, str],
+    override_tickers: set[str],
     seen: set[str],
 ) -> str | None:
     """Versucht, einen Ticker aus der Headline zu extrahieren.
     Reihenfolge: 1) direkter Ticker im Originaltext, 2) Firmenname.
+
+    Anti-False-Positive-Regeln für Firmennamen-Match:
+      - Match muss im handelbaren Ticker-Universum sein,
+        außer er stammt aus der hand-kuratierten Override-Liste.
+      - Einwort-Firmennamen müssen mindestens 5 Buchstaben haben,
+        sonst zu generisch (z.B. 'vik' für Viking Holdings).
     """
     # 1) Direkter Ticker — im Originaltext groß geschrieben
     for word in title.split():
@@ -195,9 +203,24 @@ def _resolve_ticker_from_headline(
         if ticker in seen:
             continue
         # Word-Boundary-Check, damit "apple" nicht in "pineapple" matcht
-        if f" {name} " in title_lower and len(name) > best_len:
-            best_ticker = ticker
-            best_len = len(name)
+        if f" {name} " not in title_lower:
+            continue
+        if len(name) <= best_len:
+            continue
+
+        is_override = ticker in override_tickers
+
+        # Einwort-Namen unter 5 Buchstaben sind zu generisch
+        if " " not in name and len(name) < 5 and not is_override:
+            continue
+
+        # Cross-Validation: SEC-Treffer müssen im handelbaren Universe sein.
+        # Override-Ticker (BRK.B usw.) sind kuratiert und überspringen den Check.
+        if not is_override and ticker not in known_tickers:
+            continue
+
+        best_ticker = ticker
+        best_len = len(name)
 
     return best_ticker
 
@@ -212,6 +235,7 @@ def cluster_articles(articles: List[Dict], earnings_map: Dict) -> List[Dict]:
     """
     known_tickers = _load_known_tickers()
     name_map = _load_name_to_ticker()
+    override_tickers = set(COMPANY_NAME_OVERRIDES.values())
     clusters = []
     seen = set()
 
@@ -220,7 +244,7 @@ def cluster_articles(articles: List[Dict], earnings_map: Dict) -> List[Dict]:
         title_upper = original_title.upper()  # für Earnings-Keyword-Suche
 
         ticker = _resolve_ticker_from_headline(
-            original_title, known_tickers, name_map, seen
+            original_title, known_tickers, name_map, override_tickers, seen
         )
         if ticker is None:
             continue
