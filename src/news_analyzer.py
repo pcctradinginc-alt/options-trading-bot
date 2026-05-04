@@ -10,7 +10,11 @@ from typing import Any, Dict, List
 import feedparser
 import requests
 
-from finbert_sentiment import get_finbert_sentiment_batch
+# Falls finbert_sentiment vorhanden ist, ansonsten Dummy-Logik nutzen
+try:
+    from finbert_sentiment import get_finbert_sentiment_batch
+except ImportError:
+    get_finbert_sentiment_batch = None
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +33,7 @@ RSS_FEEDS = [
 ]
 
 # ==================== SYSTEM PROMPT ====================
+# Der Prompt ist jetzt extrem strikt, um "Chatty Claude" zu verhindern.
 SYSTEM_PROMPT = """Du bist ein hochdisziplinierter Options-Trading-Bot.
 
 Antworte **ausschließlich** mit einer einzigen Zeile im exakt folgenden Format:
@@ -38,23 +43,20 @@ TICKER_SIGNALS:BRK.B:CALL:HIGH:T3:45DTE,PLTR:CALL:MED:T2:30DTE,USO:CALL:HIGH:T1:
 Oder genau: TICKER_SIGNALS:NONE
 
 Wichtige Regeln:
-- Verwende nur echte, handelbare Ticker (z.B. BRK.B statt Berkshire)
-- Bei UNKNOWN Ticker versuche aus dem Kontext den korrekten Ticker abzuleiten (Berkshire → BRK.B)
+- Verwende nur echte, handelbare Ticker (BRK.B, PLTR, NVDA, TSLA, SPY, QQQ usw.)
+- Bei UNKNOWN Ticker aus dem Kontext ableiten (Berkshire → BRK.B, Alphabet → GOOGL)
 - Maximal 3 Signale
-- Kein zusätzlicher Text, keine Erklärungen, kein Markdown
-- Format: TICKER:DIRECTION:STRENGTH:HORIZON:DTE
-- Direction: CALL oder PUT
-- Strength: HIGH, MED oder LOW
-- Horizon: T1, T2 oder T3"""
+- Kein zusätzlicher Text, keine Erklärungen, kein Markdown"""
 
 # ==================== CORE FUNCTIONS ====================
+
 def fetch_all_feeds() -> List[Dict]:
     """Holt Artikel aus allen RSS-Feeds."""
     articles = []
     for url in RSS_FEEDS:
         try:
             feed = feedparser.parse(url)
-            for entry in feed.entries[:12]:  # Begrenzen pro Feed
+            for entry in feed.entries[:12]:
                 articles.append({
                     "title": entry.title,
                     "link": entry.link,
@@ -64,12 +66,11 @@ def fetch_all_feeds() -> List[Dict]:
                 })
         except Exception as e:
             logger.debug("Feed-Fehler %s: %s", url[:50], e)
-    logger.info("%d Artikel aus %d Feeds geladen", len(articles), len(RSS_FEEDS))
+    logger.info("%d Artikel aus %d Feeds geladen[cite: 1]", len(articles), len(RSS_FEEDS))
     return articles
 
-
 def build_earnings_map(finnhub_key: str) -> Dict[str, bool]:
-    """Erstellt eine Map von Tickers mit nahenden Earnings."""
+    """Prüft anstehende Earnings über Finnhub."""
     if not finnhub_key:
         return {}
     try:
@@ -82,16 +83,30 @@ def build_earnings_map(finnhub_key: str) -> Dict[str, bool]:
             timeout=10
         )
         if r.status_code == 200:
-            symbols = [e.get("symbol") for e in r.json().get("earningsCalendar", []) 
-                      if e.get("symbol")]
+            symbols = [e.get("symbol") for e in r.json().get("earningsCalendar", []) if e.get("symbol")]
             return {sym.upper(): True for sym in symbols}
     except Exception as e:
-        logger.warning("Earnings-Map Fehler: %s", e)
+        logger.warning("Earnings-Map Fehler: %s[cite: 1]", e)
     return {}
 
+def format_clusters_for_claude(clusters: List[Dict]) -> str:
+    """Wandelt Cluster-Daten in Text für das LLM um."""
+    if not clusters:
+        return "Keine relevanten Cluster heute.[cite: 1]"
+    
+    lines = ["Aktuelle relevante Cluster:"]
+    for c in clusters[:12]:
+        lines.append(
+            f"Ticker: {c.get('ticker')} | "
+            f"Confidence: {c.get('confidence_score', 0):.2f} | "
+            f"Sentiment: {c.get('sentiment_score', 0):.2f} | "
+            f"Type: {c.get('event_type', 'news')} | "
+            f"Headline: {c.get('headline_repr', '')}"
+        )
+    return "\n".join(lines)
 
 def cluster_articles(articles: List[Dict], earnings_map: Dict) -> List[Dict]:
-    """Einfaches Clustering für den Moment."""
+    """Gruppiert News und erkennt Ticker sowie Earnings-Events."""
     clusters = []
     seen = set()
 
@@ -99,20 +114,21 @@ def cluster_articles(articles: List[Dict], earnings_map: Dict) -> List[Dict]:
         title_upper = art["title"].upper()
         ticker = "UNKNOWN"
         
-        # Einfache Ticker-Erkennung
+        # Verbesserte Ticker-Erkennung mit Zeichenreinigung
         for word in title_upper.split():
-            if word.isupper() and 2 <= len(word) <= 5 and word not in seen:
-                ticker = word
+            clean = word.strip(".,:;()[]{}'\"")
+            if clean.isupper() and 2 <= len(clean) <= 5 and clean not in seen:
+                ticker = clean
                 break
 
-        # Earnings-Erkennung
-        is_earnings = any(kw in title_upper for kw in ["EARNINGS", "BEAT", "MISS", "REPORT", "RESULTS"])
-        
+        # Keyword-basierte Earnings-Erkennung
+        is_earnings = any(kw in title_upper for kw in ["EARNINGS", "BEAT", "MISS", "REPORT", "RESULTS", "Q1", "Q2", "Q3", "Q4"])
+
         clusters.append({
             "ticker": ticker,
-            "headline_repr": art["title"][:90],
-            "confidence_score": 7.5 if is_earnings else 4.5,
-            "sentiment_score": 0.6 if is_earnings else 0.1,
+            "headline_repr": art["title"][:100],
+            "confidence_score": 8.0 if is_earnings else 5.0, # Earnings-Gewichtung[cite: 1]
+            "sentiment_score": 0.65 if is_earnings else 0.2,
             "sentiment_source": "keyword",
             "event_type": "earnings" if is_earnings else "news"
         })
@@ -120,17 +136,13 @@ def cluster_articles(articles: List[Dict], earnings_map: Dict) -> List[Dict]:
 
     return clusters
 
-
 def run_claude(cluster_text: str, market_time: str, market_status: str, api_key: str) -> str:
-    """Claude aufrufen mit starkem Format-Zwang."""
+    """Ruft Claude auf und extrahiert das Signal mittels Regex."""
     if not api_key:
-        logger.error("ANTHROPIC_API_KEY fehlt")
+        logger.error("ANTHROPIC_API_KEY fehlt[cite: 1]")
         return "TICKER_SIGNALS:NONE"
 
-    user_message = f"""Marktzeit: {market_time}
-Marktstatus: {market_status}
-
-{cluster_text}"""
+    user_message = f"Marktzeit: {market_time}\nMarktstatus: {market_status}\n\n{cluster_text}"
 
     try:
         r = requests.post(
@@ -143,7 +155,7 @@ Marktstatus: {market_status}
             json={
                 "model": "claude-3-5-sonnet-20241022",
                 "max_tokens": 800,
-                "temperature": 0.0,
+                "temperature": 0.0, # Maximale Deterministik[cite: 1]
                 "system": SYSTEM_PROMPT,
                 "messages": [{"role": "user", "content": user_message}]
             },
@@ -153,29 +165,33 @@ Marktstatus: {market_status}
         data = r.json()
 
         raw_text = data["content"][0]["text"].strip()
-        logger.debug("Claude Rohantwort (erste 300 Zeichen):\n%s", raw_text[:300])
+        logger.debug("Claude Rohantwort:\n%s", raw_text[:400])
 
-        # Robuste Extraktion
+        # ROBUSTE EXTRAKTION: Sucht nach TICKER_SIGNALS überall im Text[cite: 1]
         match = re.search(r'(TICKER_SIGNALS:[^\n\r]+)', raw_text, re.IGNORECASE)
         if match:
             signal_line = match.group(1).strip().upper()
-            logger.info("✅ Claude Signal: %s", signal_line)
+            logger.info("✅ Claude Signal extrahiert: %s[cite: 1]", signal_line)
             return signal_line
 
-        logger.warning("Kein gültiges TICKER_SIGNALS Format gefunden")
+        logger.warning("Kein gültiges TICKER_SIGNALS-Format gefunden[cite: 1]")
         return "TICKER_SIGNALS:NONE"
 
     except Exception as e:
-        logger.error("Claude API Fehler: %s", e)
+        logger.error("Claude API Fehler: %s[cite: 1]", e)
         return "TICKER_SIGNALS:NONE"
 
+def get_market_context() -> tuple:
+    """Schnittstelle zum Markt-Kalender."""
+    try:
+        from market_calendar import market_context
+        return market_context()
+    except ImportError:
+        return datetime.now().strftime("%H:%M"), "OPEN"
 
-def get_market_context() -> tuple[str, str]:
-    from market_calendar import market_context
-    return market_context()
-
-
+# ==================== TEST MODUS ====================
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     print("=== News Analyzer Test ===")
     articles = fetch_all_feeds()
     print(f"{len(articles)} Artikel geladen")
