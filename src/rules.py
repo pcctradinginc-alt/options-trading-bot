@@ -75,6 +75,17 @@ class TradingRules:
     mature_iv_to_rv_hard_block: float = 1.80
     iv_rv_penalty_factor: float = 0.18     # reduziert EV bei sehr teurer IV außerhalb Earnings
 
+    # Vega-Cost-Modell (Schritt-1-Patch).
+    # Long-Optionen verlieren systematisch Wert, wenn IV nach einem Event zurueckkommt.
+    # Vega-Cost = |vega| * (iv * crush_pct). Tradier liefert Vega "pro 1.0 IV-Punkt"
+    # (also pro 100 Prozentpunkte), daher iv_drop in derselben Einheit (Dezimal).
+    iv_crush_after_news_pct: float = 0.20         # IV faellt typisch 15-25% nach News
+    iv_crush_after_earnings_pct: float = 0.40     # IV faellt 30-50% nach Earnings
+    iv_crush_baseline_pct: float = 0.05           # Mean-Reversion ohne Event
+    # Aufschlag, wenn die IV bereits sehr hoch steht (eingepreister Move).
+    # Wird auf den Crush-Faktor draufgerechnet, wenn IV/RV oder IV-Percentile hoch sind.
+    iv_crush_high_iv_bonus_pct: float = 0.10      # +10pp bei IV/RV >= mature_hard_block oder IV-Percentile >= 90
+
     # Signal-Parsing
     valid_directions: tuple = ("CALL", "PUT")
     valid_scores: tuple = ("HIGH", "MED", "LOW")
