@@ -252,6 +252,7 @@ _NAME_BLOCKLIST = {
 
 # Modul-weiter Cache, vermeidet wiederholtes Parsen der SEC-Datei
 _cached_name_map: dict[str, str] | None = None
+_cached_cik_map: dict[int, str] | None = None
 
 
 def _headers() -> dict:
@@ -555,3 +556,48 @@ def get_company_name_to_ticker() -> dict[str, str]:
     _cached_name_map = name_map
     logger.info("Name->Ticker Mapping: %d Einträge geladen", len(name_map))
     return name_map
+
+
+def get_cik_to_ticker_map() -> dict[int, str]:
+    """Liefert Mapping CIK -> Ticker fuer SEC EDGAR Filings-Aufloesung.
+
+    Beispiel: 320193 -> "AAPL", 1318605 -> "TSLA"
+
+    Hintergrund: Der SEC-EDGAR-Atom-Feed identifiziert Firmen ueber CIK
+    (Central Index Key), nicht ueber Ticker. Wenn der News-Bot 8-K-Filings
+    aus dem SEC-Feed verarbeiten will, braucht er die Inverse der
+    Ticker->CIK-Map, die _load_ticker_map() bereits liefert.
+
+    Caveat: Mehrere Tickers koennen denselben CIK haben (z.B. BRK.A und BRK.B
+    teilen den Berkshire-CIK). Hier gewinnt der erste Eintrag in der SEC-Datei,
+    was praktisch oft die Klasse-A-Aktie ist. Fuer Trading-Zwecke ist das
+    suboptimal (BRK.B ist liquider), deshalb sollten kritische Faelle ueber
+    COMPANY_NAME_OVERRIDES nachgesteuert werden.
+    """
+    global _cached_cik_map
+    if _cached_cik_map is not None:
+        return _cached_cik_map
+
+    cik_map: dict[int, str] = {}
+    try:
+        raw = _load_sec_raw_tickers()
+        for v in raw.values():
+            ticker = (v.get("ticker") or "").upper().strip()
+            cik = v.get("cik_str")
+            if not ticker or cik is None:
+                continue
+            try:
+                cik_int = int(cik)
+            except (TypeError, ValueError):
+                continue
+            # Erster gewinnt; Override-Tickers haetten hier keine Wirkung,
+            # weil die SEC-Map nur primaere Tickers liefert.
+            if cik_int not in cik_map:
+                cik_map[cik_int] = ticker
+    except Exception as e:
+        logger.warning("CIK->Ticker Map konnte nicht geladen werden: %s", e)
+        return {}
+
+    _cached_cik_map = cik_map
+    logger.info("CIK->Ticker Mapping: %d Eintraege geladen", len(cik_map))
+    return cik_map
