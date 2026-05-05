@@ -24,15 +24,18 @@ except ImportError:
     STATIC_ETFS = {"SPY", "QQQ", "IWM", "DIA", "GLD", "SLV", "USO", "TLT"}
 
 # Firmenname -> Ticker, für Headlines wie "Apple reports earnings"
+# CIK -> Ticker, fuer SEC-EDGAR-Atom-Feeds
 try:
-    from sec_check import get_company_name_to_ticker, COMPANY_NAME_OVERRIDES
+    from sec_check import get_company_name_to_ticker, get_cik_to_ticker_map, COMPANY_NAME_OVERRIDES
 except ImportError:
     get_company_name_to_ticker = None
+    get_cik_to_ticker_map = None
     COMPANY_NAME_OVERRIDES = {}
 
 # Werden beim ersten Aufruf von cluster_articles() gefüllt (Lazy-Load)
 _KNOWN_TICKERS_CACHE: set[str] | None = None
 _NAME_TO_TICKER_CACHE: dict[str, str] | None = None
+_CIK_TO_TICKER_CACHE: dict[int, str] | None = None
 
 # Generische Akronyme, die in Headlines fast immer das Konzept meinen,
 # nicht den gleichnamigen Ticker. AI matcht z.B. C3.ai (Ticker: AI),
@@ -246,6 +249,120 @@ def _load_name_to_ticker() -> dict[str, str]:
     return _NAME_TO_TICKER_CACHE
 
 
+def _load_cik_to_ticker() -> dict[int, str]:
+    """Laedt CIK->Ticker-Mapping fuer SEC-EDGAR-Atom-Feeds (Lazy + Cache)."""
+    global _CIK_TO_TICKER_CACHE
+    if _CIK_TO_TICKER_CACHE is not None:
+        return _CIK_TO_TICKER_CACHE
+
+    if get_cik_to_ticker_map is not None:
+        try:
+            _CIK_TO_TICKER_CACHE = get_cik_to_ticker_map()
+            return _CIK_TO_TICKER_CACHE
+        except Exception as e:
+            logger.warning("CIK->Ticker Mapping nicht verfuegbar: %s", e)
+
+    _CIK_TO_TICKER_CACHE = {}
+    return _CIK_TO_TICKER_CACHE
+
+
+# SEC-EDGAR-Atom-Titles haben das Format:
+#   "8-K - APPLE INC (0000320193) (Filer)"
+#   "10-K/A - MICROSOFT CORP (0000789019) (Filer)"
+#   "4 - SMITH JOHN  (0001234567) (Reporting)"
+#   "SC 13G - SOMECORP (0000037996) (Subject Company)"
+# Der Trenner ist " - " mit Whitespace BEIDSEITIG, sodass interner Bindestrich
+# in der Form ("8-K", "10-K/A") nicht als Trenner missverstanden wird.
+_SEC_TITLE_RE = re.compile(
+    r"^\s*(?P<form>\S(?:[^\s]|\s(?!-\s))*?)"  # Form-Typ (kein " - " erlaubt)
+    r"\s+-\s+"                                  # erzwungener Trenner " - "
+    r"(?P<name>.+?)\s+"                          # Firmenname
+    r"\((?P<cik>\d{6,10})\)\s*"                 # CIK in Klammern
+    r"\((?P<role>[^)]+)\)\s*$",                  # Filer/Issuer/Reporting/Subject
+    re.IGNORECASE
+)
+
+
+def _resolve_sec_filing(article: dict, cik_map: dict[int, str]) -> tuple[str, str, str, float] | None:
+    """Behandelt SEC-EDGAR-Atom-Eintraege gesondert.
+
+    Statt im Title nach einem Ticker-Wort zu suchen, extrahiert diese Funktion
+    die CIK aus dem Klammerausdruck und schlaegt sie in der CIK->Ticker-Map nach.
+
+    Returns:
+        Tuple (ticker, headline_repr, event_type, confidence) oder None,
+        wenn der Artikel nicht von der SEC kommt oder nicht aufloesbar ist.
+    """
+    source = (article.get("source") or "").lower()
+    link = (article.get("link") or "").lower()
+    if "sec.gov" not in source and "sec.gov" not in link:
+        return None
+
+    title = article.get("title") or ""
+    cik = None
+    form = "filing"
+    name = ""
+
+    m = _SEC_TITLE_RE.match(title)
+    if m:
+        try:
+            cik = int(m.group("cik"))
+        except (TypeError, ValueError):
+            cik = None
+        form = m.group("form").upper().strip()
+        name = m.group("name").strip()
+    else:
+        # Fallback: irgendwo in Title oder Link eine 6-10-stellige Zahl in Klammern
+        cik_match = re.search(r"\((\d{6,10})\)", title)
+        if not cik_match:
+            cik_match = re.search(r"cik=0*(\d{6,10})", link)
+        if cik_match:
+            try:
+                cik = int(cik_match.group(1))
+            except (TypeError, ValueError):
+                cik = None
+        # Form aus Title herausziehen (vor dem ersten Bindestrich)
+        if "-" in title:
+            head = title.split("-", 1)[0].strip()
+            if head and len(head) <= 8:
+                form = head.upper()
+        name = title[:80]
+
+    if cik is None:
+        return None
+
+    ticker = cik_map.get(cik)
+    if not ticker:
+        # CIK nicht in unserer Map (z.B. Privatfonds, ausl. Filer ohne Ticker)
+        return None
+
+    # Kompakte Headline fuer den LLM. SEC-Titles sind redundant ("8-K - APPLE INC (...)"),
+    # wir komprimieren auf eine Form, die fuer Claude direkt einordbar ist.
+    short_name = name[:50].strip(" .,-") or ticker
+    headline = f"{ticker} SEC {form}: {short_name}"
+
+    if form in ("8-K", "8K"):
+        event_type = "8k_filing"
+        # 8-K = Material Event by SEC-Definition. Hoehere Vorab-Confidence
+        # als ein normaler News-Artikel.
+        confidence = 7.0
+    elif form == "4":
+        event_type = "form4_insider"
+        # Form 4 ohne Inhaltsanalyse ist neutral-bis-leicht-relevant.
+        confidence = 4.0
+    elif form in ("10-Q", "10-K"):
+        event_type = "earnings_filing"
+        confidence = 6.0
+    elif form in ("13D", "13G", "SC 13D", "SC 13G"):
+        event_type = "ownership_filing"
+        confidence = 5.0
+    else:
+        event_type = "sec_filing"
+        confidence = 3.5
+
+    return ticker, headline, event_type, confidence
+
+
 def _resolve_ticker_from_headline(
     title: str,
     known_tickers: set[str],
@@ -317,18 +434,44 @@ def _resolve_ticker_from_headline(
 def cluster_articles(articles: List[Dict], earnings_map: Dict) -> List[Dict]:
     """Gruppiert News und erkennt Ticker sowie Earnings-Events.
 
-    Ticker-Erkennung in zwei Stufen:
+    Ticker-Erkennung in drei Stufen:
+      0. SEC-EDGAR-Atom-Eintraege: CIK aus Title -> Ticker via SEC-Map.
+         (Wird zuerst versucht, weil SEC-Titles kein Ticker-Wort enthalten.)
       1. Direkter Ticker in Headline ("AAPL beats Q4...")
       2. Firmenname in Headline ("Apple reports record earnings")
     Cluster ohne erkennbaren Ticker werden verworfen.
     """
     known_tickers = _load_known_tickers()
     name_map = _load_name_to_ticker()
+    cik_map = _load_cik_to_ticker()
     override_tickers = set(COMPANY_NAME_OVERRIDES.values())
     clusters = []
     seen = set()
 
     for art in articles:
+        # Stufe 0: SEC-EDGAR-Atom hat CIK statt Ticker im Titel.
+        sec_resolved = _resolve_sec_filing(art, cik_map)
+        if sec_resolved is not None:
+            ticker, headline, event_type, confidence = sec_resolved
+            if ticker in seen:
+                continue
+            # Sicherheits-Check: Ticker muss handelbar sein. Manche SEC-Tickers
+            # sind nur Pink-Sheet, OTC oder zu illiquide.
+            if ticker not in known_tickers and ticker not in override_tickers:
+                logger.debug("SEC-Ticker %s nicht im handelbaren Universum, verworfen", ticker)
+                continue
+            clusters.append({
+                "ticker": ticker,
+                "headline_repr": headline[:100],
+                "confidence_score": confidence,
+                "sentiment_score": 0.0,  # Aus Filing-Title nicht ableitbar
+                "sentiment_source": "sec_filing",
+                "event_type": event_type,
+            })
+            seen.add(ticker)
+            continue
+
+        # Stufe 1+2: Klassischer Headline-Resolver
         original_title = art["title"]
         title_upper = original_title.upper()  # für Earnings-Keyword-Suche
 
