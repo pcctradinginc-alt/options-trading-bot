@@ -40,23 +40,30 @@ _NAME_TO_TICKER_CACHE: dict[str, str] | None = None
 _GENERIC_ACRONYMS = {
     "AI", "IT", "IP", "EV", "CEO", "CFO", "CTO", "IPO",
     "API", "SAAS", "ESG", "AR", "VR", "ML",
-    "USA", "UK", "GDP", "FED", "ETF", "REIT", "SPAC",
+    "USA", "UK", "EU", "US", "UN", "GDP", "FED", "ETF", "REIT", "SPAC",
+    # NEU 2026: Headlines wie "UK Gilt Yields Near 30-Year Highs" matchten
+    # frueher faelschlich auf den Ticker UK. EU/US/UN aus gleichem Grund ergaenzt.
 }
 
 logger = logging.getLogger(__name__)
 
 # ==================== RSS FEEDS ====================
+# Kuratierte Liste: nur Feeds, die in 2026 noch zuverlaessig liefern.
+# Reuters wurde 2020 abgeschaltet, FeedBurner halb-tot, Benzinga-Duplikat entfernt.
+# Ergaenzt: SEC EDGAR (8-K Material Events) und MarketWatch (Dow-Jones-Marke).
 RSS_FEEDS = [
-    "https://feeds.reuters.com/reuters/businessNews",
-    "https://feeds.reuters.com/reuters/marketsNews",
+    # Aggregatoren / Breaking News
     "https://www.cnbc.com/id/100003114/device/rss/rss.xml",
     "https://www.cnbc.com/id/100727362/device/rss/rss.xml",
     "https://feeds.benzinga.com/benzinga",
-    "https://www.benzinga.com/feed",
-    "http://feeds.feedburner.com/zerohedge/feed",
     "https://finance.yahoo.com/rss/headline",
     "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
     "https://www.wsj.com/xml/rss/3_7041.xml",
+    "https://feeds.content.dowjones.io/public/rss/mw_topstories",  # MarketWatch
+    # Direktquelle Material Events (CIK -> Ticker mapping noetig)
+    "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom",
+    # Macro-Trigger fuer VIX/TLT/SPY-Plays
+    "https://www.federalreserve.gov/feeds/press_all.xml",
 ]
 
 # ==================== SYSTEM PROMPT ====================
@@ -77,23 +84,92 @@ Wichtige Regeln:
 
 # ==================== CORE FUNCTIONS ====================
 
-def fetch_all_feeds() -> List[Dict]:
-    """Holt Artikel aus allen RSS-Feeds."""
-    articles = []
+def fetch_all_feeds(max_age_minutes: int = 720) -> List[Dict]:
+    """Holt Artikel aus allen RSS-Feeds.
+
+    Verbesserungen 2026:
+    - Pro-Feed-Diagnose auf INFO/WARNING-Level (zeigt tote Feeds sofort).
+    - Frische-Filter: Artikel aelter als max_age_minutes werden verworfen.
+      Default 720min = 12h. Bei Cron-Lauf um 09:35 ET deckt das Pre-Market und
+      die letzten Abend-News des Vortags ab.
+    - User-Agent setzen (SEC EDGAR und einige andere Quellen blocken Default-UA).
+    """
+    import time
+    from datetime import datetime, timezone
+
+    cutoff_ts = datetime.now(timezone.utc).timestamp() - max_age_minutes * 60
+    articles: List[Dict] = []
+    feed_stats: List[tuple] = []  # (url_short, anzahl, status)
+
+    # Hoeflicher User-Agent. SEC EDGAR verlangt ihn explizit.
+    ua = "DailyOptionsBot/1.0 (contact: bot@example.com) feedparser"
+
     for url in RSS_FEEDS:
+        url_short = url.split("/")[2].replace("www.", "").replace("feeds.", "")
+        before = len(articles)
         try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:12]:
+            feed = feedparser.parse(url, agent=ua)
+
+            # bozo=1 + keine Eintraege => Parse-/Netzwerk-Fehler
+            if getattr(feed, "bozo", 0) and not feed.entries:
+                exc = getattr(feed, "bozo_exception", "unknown")
+                feed_stats.append((url_short, 0, f"PARSE_ERROR: {str(exc)[:60]}"))
+                continue
+
+            entries = feed.entries[:12] if feed.entries else []
+            kept = 0
+            stale = 0
+            for entry in entries:
+                # Frische-Filter
+                pub_struct = entry.get("published_parsed") or entry.get("updated_parsed")
+                if pub_struct:
+                    try:
+                        pub_ts = time.mktime(pub_struct)
+                        if pub_ts < cutoff_ts:
+                            stale += 1
+                            continue
+                    except (TypeError, ValueError, OverflowError):
+                        pub_ts = None
+                else:
+                    pub_ts = None
+
+                # title kann fehlen (selten, aber bei SEC EDGAR moeglich)
+                title = entry.get("title")
+                if not title:
+                    continue
+
                 articles.append({
-                    "title": entry.title,
-                    "link": entry.link,
+                    "title": title,
+                    "link": entry.get("link", ""),
                     "published": entry.get("published", entry.get("updated", "")),
-                    "source": url.split("/")[2].replace("www.", "").replace("feeds.", ""),
+                    "published_ts": pub_ts,
+                    "source": url_short,
                     "summary": entry.get("summary", "")[:300]
                 })
+                kept += 1
+
+            delivered = len(articles) - before
+            if delivered == 0 and stale == 0:
+                feed_stats.append((url_short, 0, "LEER"))
+            elif delivered == 0 and stale > 0:
+                feed_stats.append((url_short, 0, f"alle {stale} zu alt (>{max_age_minutes}min)"))
+            else:
+                note = f"ok ({stale} verworfen wegen Alter)" if stale else "ok"
+                feed_stats.append((url_short, delivered, note))
+
         except Exception as e:
-            logger.debug("Feed-Fehler %s: %s", url[:50], e)
-    logger.info("%d Artikel aus %d Feeds geladen", len(articles), len(RSS_FEEDS))
+            feed_stats.append((url_short, 0, f"EXCEPTION: {type(e).__name__}: {str(e)[:60]}"))
+
+    # Pro-Feed-Report
+    alive = sum(1 for _, n, _ in feed_stats if n > 0)
+    logger.info("Feed-Report: %d von %d Feeds lieferten Artikel", alive, len(RSS_FEEDS))
+    for url_short, n, status in feed_stats:
+        if n > 0:
+            logger.info("  ok %-32s %2d Artikel  (%s)", url_short, n, status)
+        else:
+            logger.warning("  -- %-32s  0 Artikel  (%s)", url_short, status)
+    logger.info("%d Artikel gesamt aus %d aktiven Feeds (Frische-Filter %dmin)",
+                len(articles), alive, max_age_minutes)
     return articles
 
 
