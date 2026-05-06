@@ -127,7 +127,9 @@ RSS_FEEDS = [
     "https://www.cnbc.com/id/100003114/device/rss/rss.html",            # CNBC Top News
     "https://www.cnbc.com/id/10001147/device/rss/rss.html",             # CNBC Business
     "https://www.cnbc.com/id/15839135/device/rss/rss.html",             # CNBC Earnings
-    "https://feeds.benzinga.com/benzinga",
+    # NOTE: Benzinga (feeds.benzinga.com/benzinga) entfernt — seit Monaten
+    # SSL-Error trotz Retry. Aggregator-Coverage durch CNBC + GlobeNewswire
+    # ausreichend.
 
     # --- Dow Jones / WSJ / MarketWatch (alle ueber content.dowjones.io) ---
     "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
@@ -144,22 +146,24 @@ RSS_FEEDS = [
     "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml",
     "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/drugs/rss.xml",
 
-    # --- EIA (Oel/Gas-Plays - jeden Mi 10:30 ET) ---
-    "https://www.eia.gov/rss/press_rss.xml",
+    # --- EIA / BLS / Fed: Event-getriggerte Quellen ---
+    # An den meisten Tagen LEER oder STALE — das ist erwartetes Verhalten.
+    # CPI: 1x/Monat. NFP: 1x/Monat (1. Freitag). Fed: unregelmaessig.
+    # EIA Weekly Petroleum (Mi 10:30 ET) ist NICHT in press_rss.xml - dafuer
+    # gibt es keinen offiziellen RSS-Feed, muss ggf. via Scraping geholt werden.
     "https://www.eia.gov/rss/todayinenergy.xml",
-
-    # --- BLS (CPI / NFP - Macro-Vola) ---
     "https://www.bls.gov/feed/empsit.rss",
     "https://www.bls.gov/feed/cpi.rss",
-
-    # --- Treasury / Fed ---
-    "https://home.treasury.gov/news/press-releases/feed",
     "https://www.federalreserve.gov/feeds/press_all.xml",
+    # NOTE: home.treasury.gov/news/press-releases/feed entfernt — gibt 404.
+    # Treasury hat keinen offiziellen Press-Release-RSS mehr, nur XML-Feeds
+    # fuer Zinsraten unter /resource-center/data-chart-center/...
 
     # --- Press-Release-Wires (Resolver via (NASDAQ: XYZ)-Pattern) ---
     "https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/Public%20Companies",
-    "https://feeds.businesswire.com/BW/IND_HEALTH",
-    "https://feeds.businesswire.com/BW/IND_HIGHTECH",
+    # NOTE: BusinessWire feeds.businesswire.com/BW/IND_* URLs entfernt — diese
+    # Struktur existiert nicht oeffentlich. GlobeNewswire deckt die meisten
+    # gleichen Pressemitteilungen ab.
 ]
 
 # ==================== SYSTEM PROMPT ====================
