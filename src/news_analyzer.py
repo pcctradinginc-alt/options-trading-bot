@@ -1,6 +1,6 @@
 """
 news_analyzer.py — News Fetching, Clustering und Alpha-Katalysator-Validierung
-Stand 2026 (v2.3 - High Conviction Catalyst Edition)
+Stand 2026 (v2.3)
 """
 
 import logging
@@ -42,8 +42,8 @@ CATALYST_WEIGHTS = {
     "phase_3": 2.1,
     "merger": 2.2,
     "acquisition": 2.2,
-    "activist_entry": 2.3,      # 13D
-    "passive_stake": 1.45,      # 13G
+    "activist_entry": 2.3,
+    "passive_stake": 1.45,
     "8k_material_event": 1.95,
     "earnings_beat": 1.85,
     "guidance_raise": 2.0,
@@ -79,7 +79,6 @@ _USER_AGENT = os.environ.get(
 _FEED_HEADERS = {
     "User-Agent": _USER_AGENT,
     "Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5",
-    "Accept-Encoding": "gzip, deflate",
 }
 
 # ==================== RSS FEEDS ====================
@@ -188,12 +187,12 @@ def fetch_all_feeds() -> list[dict]:
 
 
 def build_earnings_map(finnhub_key: str) -> dict:
-    """Stub – später erweiterbar"""
     return {}
 
 
 # ==================== RESOLVERS ====================
-def _resolve_sec_filing(article: dict, cik_map: dict) -> Optional[tuple]:
+def _resolve_sec_filing(article: dict, cik_map: dict):
+    # ... (wie vorher) ...
     title = article.get("title") or ""
     m = _SEC_TITLE_RE.match(title)
     if not m:
@@ -250,7 +249,6 @@ def _resolve_ticker_from_headline(title: str, summary: str = "") -> Optional[str
     for name, ticker in name_map.items():
         if name.upper() in text:
             return ticker
-
     return None
 
 
@@ -264,12 +262,10 @@ def cluster_articles(articles: List[Dict], earnings_map: Dict) -> List[Dict]:
         conf = 5.0
         event_type = "news_standard"
 
-        # SEC Filing
         sec_res = _resolve_sec_filing(art, cik_map)
         if sec_res:
             ticker, headline, event_type, conf = sec_res
         else:
-            # Wire Ticker
             ticker = _resolve_wire_ticker(art)
             if ticker:
                 event_type = "wire_strong"
@@ -281,7 +277,6 @@ def cluster_articles(articles: List[Dict], earnings_map: Dict) -> List[Dict]:
         if not ticker:
             continue
 
-        # Catalyst Boost
         lower_title = art["title"].lower()
         if any(x in lower_title for x in ["fda", "approval", "phase 3"]):
             event_type = "fda_approval"
@@ -303,6 +298,16 @@ def cluster_articles(articles: List[Dict], earnings_map: Dict) -> List[Dict]:
     clusters = sorted(ticker_signals.values(), key=lambda x: x["confidence_score"], reverse=True)
     logger.info("Cluster erstellt: %d Ticker", len(clusters))
     return clusters
+
+
+def format_clusters_for_claude(clusters: List[Dict]) -> str:
+    """Wird von main.py benötigt"""
+    if not clusters:
+        return "Keine relevanten News-Cluster heute."
+    lines = ["Aktuelle High-Conviction News-Cluster:"]
+    for c in clusters[:12]:
+        lines.append(f"{c['ticker']}: {c['headline_repr']} (conf={c['confidence_score']})")
+    return "\n".join(lines)
 
 
 # ==================== CLAUDE ====================
@@ -340,7 +345,6 @@ def run_claude(cluster_text: str, market_time: str, market_status: str, api_key:
             logger.info("✅ Claude Signal: %s", signal_line)
             return signal_line
 
-        logger.warning("Kein gültiges Signal-Format gefunden")
         return "TICKER_SIGNALS:NONE"
 
     except Exception as e:
@@ -363,5 +367,5 @@ if __name__ == "__main__":
     articles = fetch_all_feeds()
     print(f"{len(articles)} Artikel geladen")
     clusters = cluster_articles(articles, {})
-    for c in clusters[:10]:
-        print(f" → {c['ticker']:6} | {c['confidence_score']:.1f} | {c['event_type']:18} | {c['headline_repr'][:70]}")
+    for c in clusters[:8]:
+        print(f" → {c['ticker']:6} | {c['confidence_score']:.1f} | {c['headline_repr'][:80]}")
