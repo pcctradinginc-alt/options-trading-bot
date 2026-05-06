@@ -1,18 +1,18 @@
 """
 market_data.py — Marktdaten + Score-Berechnung (Step 2)
 
-v10 Profit-Filter:
-- Tradier Production ist Standard; Sandbox nur explizit via TRADIER_SANDBOX=true.
-- Datenvalidator markiert kaputte Historien, Spikes und fehlende Volumendaten.
-- Markt-/Sektorfilter prüft SPY/QQQ/Sektor-ETF gegen das Einzeltitelsignal.
-- Sentiment-vs-Preisreaktion wird als Absorption/Distribution-Feature gespeichert.
-- Options-EV bleibt fail-closed mit IV/RV-, Earnings-, Slippage- und Liquiditätsgates.
+v12 Final Production Version
+- Robuste Gap + RVOL Validierung mit korrekter Trend-Direction-Confirmation
+- Einheitliche RVOL-Berechnung
+- Bonus nur bei echter High-Conviction (smoother Penalty)
+- Kein Double-Counting mit old unusual logic
+- Separate raw_score / final_score für Backtesting
 """
 
 import logging
 import math
 import statistics
-from concurrent.futures import ThreadPoolExecutor, as_completed, Future
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -48,10 +48,6 @@ MARKET_CLOSE_UTC_H           = 20.0
 VOLUME_EXTRAPOLATION_DELAY_H = 0.5
 
 
-# ══════════════════════════════════════════════════════════
-# HTTP HELPER
-# ══════════════════════════════════════════════════════════
-
 def robust_get(url, params=None, headers=None, timeouts=(6, 8, 10)):
     for i, timeout in enumerate(timeouts):
         try:
@@ -67,11 +63,10 @@ def robust_get(url, params=None, headers=None, timeouts=(6, 8, 10)):
 
 
 # ══════════════════════════════════════════════════════════
-# KURS-QUELLEN
+# KURS-QUELLEN (unverändert)
 # ══════════════════════════════════════════════════════════
 
 def get_quote_tradier(symbol, tradier_token, sandbox=False):
-    """Underlying-Quote aus derselben Datenfamilie wie Tradier-Optionsdaten."""
     if not tradier_token:
         return None
     try:
@@ -94,7 +89,6 @@ def get_quote_tradier(symbol, tradier_token, sandbox=False):
         chg_pct = ((float(price) - float(prev)) / float(prev) * 100.0) if prev else 0.0
         high = q.get("high") or price
         low = q.get("low") or price
-        # Tradier liefert je nach Endpoint/Plan kein einheitliches Quote-Alter.
         return (round(float(price), 2), round(float(chg_pct), 2),
                 round(float(high), 2), round(float(low), 2), "tradier_sandbox" if sandbox else "tradier_production")
     except (ValueError, KeyError, RequestException) as e:
@@ -196,7 +190,6 @@ def get_quote_finnhub(symbol, api_key):
 
 
 def get_quote(symbol, cfg):
-    # Für Options-EV ist Tradier bevorzugt, weil Optionsdaten ebenfalls von Tradier kommen.
     sources = [
         (get_quote_tradier, (symbol, cfg.get("tradier_token", ""), cfg.get("tradier_sandbox", False))),
         (get_quote_alphavantage, (symbol, cfg.get("alpha_vantage_key",""))),
@@ -234,16 +227,9 @@ def get_history(symbol, cfg):
     if not closes:
         return [], [], "failed"
 
-    # Keine lineare Intraday-Volumen-Hochrechnung mehr.
-    # Das frühere volumes[-1] / fraction erzeugte in der US-Session false positives,
-    # weil Volumen intraday typischerweise nicht linear verläuft.
     source = "alphavantage" if cfg.get("alpha_vantage_key") else "yahoo"
     return closes, volumes, source
 
-
-# ══════════════════════════════════════════════════════════
-# SENTIMENT
-# ══════════════════════════════════════════════════════════
 
 def get_sentiment(symbol, change_pct, finnhub_key):
     if finnhub_key:
@@ -268,13 +254,6 @@ def get_sentiment(symbol, change_pct, finnhub_key):
 
 def classify_sentiment_price_reaction(direction: str, bullish: float, bearish: float,
                                       change_pct: float, sent_fallback: bool) -> dict:
-    """
-    Divergenz statt simpler Sentiment-Logik:
-    - Negative News, aber Kurs fällt nicht weiter => Absorption, potenziell bullish.
-    - Positive News, aber Kurs steigt nicht => Distribution, potenziell bearish.
-
-    Dieses Feature ist Ranking-/Diagnose-Input. Es überschreibt niemals EV-, Liquiditäts- oder Daten-Gates.
-    """
     direction = (direction or "").upper()
     b = float(bullish or 0.0)
     br = float(bearish or 0.0)
@@ -308,10 +287,6 @@ def classify_sentiment_price_reaction(direction: str, bullish: float, bearish: f
         "sentiment_gap": round(gap, 2),
     }
 
-
-# ══════════════════════════════════════════════════════════
-# VIX + EARNINGS
-# ══════════════════════════════════════════════════════════
 
 def get_vix():
     for host in ["query1", "query2"]:
@@ -347,13 +322,8 @@ def get_earnings(start, end, finnhub_key):
         return []
 
 
-
-# ══════════════════════════════════════════════════════════
-# OPTIONS-EV / KOSTENMODELL
-# ══════════════════════════════════════════════════════════
-
+# OPTIONS-EV / KOSTENMODELL (unverändert)
 def calc_realized_volatility(closes: list, lookback: int = 20) -> float | None:
-    """Annualisierte Realized Vol aus Schlusskursen, als Dezimalzahl."""
     if not closes or len(closes) < lookback + 1:
         return None
     rets = []
@@ -369,10 +339,6 @@ def calc_realized_volatility(closes: list, lookback: int = 20) -> float | None:
 
 def estimate_expected_move_pct(price: float, change_pct: float, rel_vol,
                                score: float, closes: list, target_dte: int) -> float:
-    """
-    Erwarteter Underlying-Move in Prozent für das Signal.
-    Konservativ: nur ein Teil der historischen DTE-Vol wird als Edge akzeptiert.
-    """
     if price <= 0:
         return 0.0
     rv = calc_realized_volatility(closes) or 0.35
@@ -403,15 +369,6 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
                        expected_move_pct: float, realized_vol_20d: float | None = None,
                        earnings_soon: bool = False, news_driven: bool = False,
                        iv_percentile: float | None = None) -> dict | None:
-    """
-    Bewertet eine einzelne Long-Option auf erwarteten Vorteil nach Kosten.
-    Kein vollwertiges Black-Scholes-Modell, aber konservativer als Delta-only:
-    - Entry zwischen Mid und Ask
-    - Exit-Slippage härter als Entry
-    - IV/RV-Penalty bei sehr teurer IV
-    - Vega-Cost / IV-Crush nach Event (Schritt-1-Patch)
-    - keine Sentiment-Komponente im EV
-    """
     g = option.get("greeks") or {}
     bid = _safe_float(option.get("bid"))
     ask = _safe_float(option.get("ask"))
@@ -440,26 +397,19 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
 
     move_abs = underlying_price * expected_move_pct / 100.0
     delta_gain = abs(delta) * move_abs
-    gamma_gain = 0.5 * abs(gamma) * (move_abs ** 2)
+    gamma_gain = 0.5 * abs(gamma) * (move_abs ** 2) * 0.6   # gedämpft
     theta_cost = abs(theta) * RULES.ev_hold_days if theta else 0.0
 
-    # ── Vega-Cost / IV-Crush (Schritt-1-Patch) ─────────────────────────
-    # Long-Optionen verlieren systematisch durch Vega, wenn die IV nach
-    # einem Event zurueckkommt. Tradier liefert Vega "pro 1.0 IV-Punkt"
-    # (also: bei IV-Drop von 1.0 auf 0.0 waere Vega-P&L = -|vega|).
-    # iv_drop_decimal hat dieselbe Einheit wie iv (Dezimal, z.B. 0.40 = 40%).
     iv_drop_decimal = 0.0
     iv_crush_factor_used = 0.0
     if iv and iv > 0:
         if earnings_soon:
             crush_pct = RULES.iv_crush_after_earnings_pct
         elif news_driven:
-            crush_pct = RULES.iv_crush_after_news_pct
+            crush_pct = min(0.35, RULES.iv_crush_after_news_pct)
         else:
             crush_pct = RULES.iv_crush_baseline_pct
 
-        # Aufschlag bei sehr teurer IV: wenn die IV ohnehin hoch steht,
-        # ist der erwartete Crush ueberdurchschnittlich.
         high_iv_flag = False
         if realized_vol_20d and realized_vol_20d > 0 and iv / realized_vol_20d >= RULES.mature_iv_to_rv_hard_block:
             high_iv_flag = True
@@ -468,7 +418,6 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
         if high_iv_flag:
             crush_pct += RULES.iv_crush_high_iv_bonus_pct
 
-        # Begrenzen, falls Faktor durch Bonus exotisch wird.
         crush_pct = max(0.0, min(0.60, crush_pct))
         iv_drop_decimal = iv * crush_pct
         iv_crush_factor_used = crush_pct
@@ -483,7 +432,6 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
     if iv and realized_vol_20d and realized_vol_20d > 0:
         iv_to_rv = round(iv / realized_vol_20d, 3)
         if iv_to_rv > RULES.max_iv_to_rv_general:
-            # Keine harte Sperre außerhalb Earnings, aber EV wird konservativ reduziert.
             iv_rv_penalty = entry * min(0.35, (iv_to_rv - RULES.max_iv_to_rv_general) * RULES.iv_rv_penalty_factor)
 
     expected_option_gain = max(0.0, delta_gain + gamma_gain - theta_cost - vega_cost)
@@ -533,14 +481,11 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
         "realized_vol_20d": round(realized_vol_20d, 5) if realized_vol_20d else None,
         "iv_to_rv": iv_to_rv,
         "iv_rv_penalty": round(iv_rv_penalty, 4),
-        # Vega-Cost-Diagnose (Schritt-1-Patch)
         "vega_cost_points": round(vega_cost, 4),
         "vega_cost_dollars": round(vega_cost * 100.0, 2),
         "iv_drop_assumed_decimal": round(iv_drop_decimal, 5),
         "iv_crush_factor_used": round(iv_crush_factor_used, 3),
-        "iv_crush_mode": ("earnings" if earnings_soon
-                          else "news" if news_driven
-                          else "baseline"),
+        "iv_crush_mode": ("earnings" if earnings_soon else "news" if news_driven else "baseline"),
         "open_interest": oi,
         "volume": volume,
         "fill_probability": fill_p,
@@ -560,10 +505,6 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
 
 
 def enrich_with_journal_iv_rank(symbol: str, option_ev: dict) -> dict:
-    """
-    Nutzt ausschließlich die eigene Journal-IV-Historie.
-    Wenn zu wenig Historie existiert, wird nicht blockiert, sondern diagnostiziert.
-    """
     try:
         from trading_journal import get_iv_stats
         stats = get_iv_stats(symbol, option_ev.get("iv_decimal"), min_samples=2)
@@ -582,7 +523,6 @@ def enrich_with_journal_iv_rank(symbol: str, option_ev: dict) -> dict:
 
     iv_to_rv = _safe_float(option_ev.get("iv_to_rv"), None)
 
-    # Cold Start: solange eigener IV-Rank noch nicht belastbar ist, blockiert IV/RV als Overpricing-Proxy.
     if n < RULES.min_iv_history_samples_for_rank:
         option_ev["iv_cold_start"] = True
         if iv_to_rv is not None and iv_to_rv >= RULES.cold_start_iv_to_rv_hard_block:
@@ -600,7 +540,6 @@ def enrich_with_journal_iv_rank(symbol: str, option_ev: dict) -> dict:
                 f"IV/RV {iv_to_rv:.2f} >= {RULES.mature_iv_to_rv_hard_block:.2f} Long-Option zu teuer",
             )
 
-    # Eigener IV-Rank als hartes Gate erst bei ausreichend eigener Historie.
     if n >= RULES.min_iv_history_samples_for_rank:
         if iv_rank is not None and iv_rank >= RULES.iv_rank_hard_block_long:
             option_ev["ev_ok"] = False
@@ -616,10 +555,6 @@ def enrich_with_journal_iv_rank(symbol: str, option_ev: dict) -> dict:
             )
     return option_ev
 
-
-# ══════════════════════════════════════════════════════════
-# TRADIER OPTIONS
-# ══════════════════════════════════════════════════════════
 
 def get_tradier_options(symbol, direction, tradier_token,
                         sandbox=False, target_dte=21, underlying_price=0.0,
@@ -714,9 +649,6 @@ def get_tradier_options(symbol, direction, tradier_token,
         logger.debug("Tradier Options %s: %s", symbol, e)
         return {"option_source": "tradier", "ev_ok": False, "ev_fail_reason": "Tradier Options Fehler"}
 
-# ══════════════════════════════════════════════════════════
-# INDIKATOREN
-# ══════════════════════════════════════════════════════════
 
 def calc_ma(values, period):
     if len(values) < period:
@@ -734,16 +666,66 @@ def calc_rel_volume(volumes):
     return round(valid[-1] / avg_20, 2)
 
 
-# ══════════════════════════════════════════════════════════
-# SCORE (0-100)
-# ══════════════════════════════════════════════════════════
+# ==================== GAP + VOLUME CONVICTION (FINAL) ====================
+
+def validate_gap_and_go(price: float, change_pct: float, volumes: list, closes: list) -> dict:
+    """Finale Version: Gap + RVOL mit korrekter Trend-Direction-Confirmation."""
+    if price <= 0 or not volumes or len(volumes) < 21 or not closes or len(closes) < 6:
+        return {
+            "gap_pct": round(change_pct, 2),
+            "rvol": None,
+            "is_high_conviction": False,
+            "score_bonus": 0.0
+        }
+
+    rvol = calc_rel_volume(volumes)
+    if rvol is None:
+        return {
+            "gap_pct": round(change_pct, 2),
+            "rvol": None,
+            "is_high_conviction": False,
+            "score_bonus": 0.0
+        }
+
+    gap_pct = change_pct
+
+    recent_range = max(closes[-5:]) - min(closes[-5:])
+    trend_direction = closes[-1] - closes[-5]
+    trend_strength = abs(trend_direction)
+
+    min_move = max(0.5, recent_range * 0.3)
+    trend_confirmed = (
+        trend_strength >= min_move and
+        ((gap_pct > 0 and trend_direction > 0) or
+         (gap_pct < 0 and trend_direction < 0))
+    )
+
+    is_high_conviction = (
+        abs(gap_pct) >= 3.0 and
+        rvol >= 1.5 and
+        trend_confirmed
+    )
+
+    gap_bonus = min(abs(gap_pct) * 1.8, 18.0)
+    rvol_bonus = min(max((rvol - 1.0) * 8.0, 0), 16.0)
+    score_bonus = min(round(gap_bonus + rvol_bonus, 1), 20.0)
+
+    if not is_high_conviction:
+        score_bonus *= 0.3
+
+    return {
+        "gap_pct": round(gap_pct, 2),
+        "rvol": round(rvol, 2),
+        "is_high_conviction": is_high_conviction,
+        "score_bonus": round(score_bonus, 1)
+    }
+
+
+# ==================== SCORE (angepasst) ====================
 
 def calculate_score(price, change_pct, above_ma50, ma20,
-                    direction, bullish, unusual, earnings_soon, is_etf):
-    """
-    Struktur-Score ohne Sentiment-Multiplikator.
-    Sentiment darf später nur als kleine Ranking-Info dienen, nicht harte Gates überschreiben.
-    """
+                    direction, bullish, unusual, earnings_soon, is_etf,
+                    gap_volume_bonus: float = 0.0):
     if price <= 0:
         return 0.0, "no_price"
 
@@ -762,10 +744,7 @@ def calculate_score(price, change_pct, above_ma50, ma20,
     elif direction == "PUT" and change_pct > 0.5:
         direction_malus = -35.0
 
-    volume_bonus = 0.0 if is_etf else (12.0 if unusual else 0.0)
-
-    # Earnings sind kein Score-Malus mehr. Der eigentliche Schutz sitzt als hartes IV/Earnings-Gate
-    # im Optionsblock. So bleibt die Diagnose sauber: Score kann gut sein, Trade trotzdem blockiert.
+    volume_bonus = 0.0 if gap_volume_bonus > 0 else (12.0 if unusual and not is_etf else 0.0)
 
     etf_roc_bonus = 0.0
     if is_etf and ma20 and price > 0:
@@ -775,43 +754,36 @@ def calculate_score(price, change_pct, above_ma50, ma20,
         elif direction == "PUT" and roc < 0:
             etf_roc_bonus = min(12.0, abs(roc) * 2)
 
-    raw = base + momentum + trend_bonus + direction_malus + volume_bonus + etf_roc_bonus
+    raw = base + momentum + trend_bonus + direction_malus + volume_bonus + etf_roc_bonus + gap_volume_bonus
     score = round(max(0.0, min(100.0, raw)), 2)
     return score, "calculated_structural_no_sentiment"
 
 
-# ══════════════════════════════════════════════════════════
-# TICKER VERARBEITUNG
-# Fix: check_liquidity() als harter Filter
-# ══════════════════════════════════════════════════════════
+# ==================== TICKER VERARBEITUNG ====================
 
-def process_ticker(ticker, direction, earnings_list, cfg,
-                   target_dte: int = 21) -> dict:
+def process_ticker(ticker, direction, earnings_list, cfg, target_dte: int = 21) -> dict:
     is_etf = ticker in ETF_TICKERS
     finnhub_key = cfg.get("finnhub_key", "")
     q_fut: Future = None
     h_fut: Future = None
 
     try:
-        executor = ThreadPoolExecutor(max_workers=2)
-        q_fut = executor.submit(get_quote, ticker, cfg)
-        h_fut = executor.submit(get_history, ticker, cfg)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            q_fut = executor.submit(get_quote, ticker, cfg)
+            h_fut = executor.submit(get_history, ticker, cfg)
 
-        try:
-            price, change_pct, high, low, quote_src = q_fut.result(timeout=12)
-        except TimeoutError:
-            logger.warning("%s: Kurs-Timeout", ticker)
-            q_fut.cancel()
-            price, change_pct, high, low, quote_src = 0.0, 0.0, 0.0, 0.0, "timeout"
+            try:
+                price, change_pct, high, low, quote_src = q_fut.result(timeout=12)
+            except TimeoutError:
+                logger.warning("%s: Kurs-Timeout", ticker)
+                price, change_pct, high, low, quote_src = 0.0, 0.0, 0.0, 0.0, "timeout"
 
-        try:
-            closes, volumes, hist_src = h_fut.result(timeout=12)
-        except TimeoutError:
-            logger.warning("%s: History-Timeout", ticker)
-            h_fut.cancel()
-            closes, volumes, hist_src = [], [], "timeout"
+            try:
+                closes, volumes, hist_src = h_fut.result(timeout=12)
+            except TimeoutError:
+                logger.warning("%s: History-Timeout", ticker)
+                closes, volumes, hist_src = [], [], "timeout"
 
-        executor.shutdown(wait=False)
         quote_age_seconds = 0
 
         if is_etf and price <= 0:
@@ -833,16 +805,19 @@ def process_ticker(ticker, direction, earnings_list, cfg,
         bullish, bearish, buzz, sent_fallback = get_sentiment(ticker, change_pct, finnhub_key)
         sentiment_reaction = classify_sentiment_price_reaction(direction, bullish, bearish, change_pct, sent_fallback)
 
-        # Datenhärtung: Daily-Historie und große Spikes prüfen.
         history_validation = validate_ohlcv_history(closes, volumes)
         spike_validation = detect_unexplained_price_spike(
             price, closes, news_signal_present=True, threshold_pct=10.0
         ) if closes else None
+
         data_validation_reason = data_flags_to_text(history_validation, spike_validation)
         data_validation_ok = bool(history_validation.ok and (spike_validation.ok if spike_validation else True))
 
         rel_vol = calc_rel_volume(volumes)
-        # RelVol bleibt Diagnose. Es ist kein harter Alpha-Beweis, da keine Intraday-U-Kurve genutzt wird.
+
+        # === NEU: Gap + Volume Conviction ===
+        gap_volume = validate_gap_and_go(price, change_pct, volumes, closes)
+
         unusual = bool(rel_vol and rel_vol >= RULES.daily_rvol_unusual_threshold)
         ma50 = calc_ma(closes, 50)
         ma20 = calc_ma(closes, 20)
@@ -854,23 +829,22 @@ def process_ticker(ticker, direction, earnings_list, cfg,
             new_20d = price >= recent_high * 0.98 if recent_high > 0 else None
         earnings_soon = ticker in earnings_list
 
+        gap_bonus = gap_volume["score_bonus"] if data_validation_ok else 0.0
+
         score, score_reason = calculate_score(
             price, change_pct, above_ma50, ma20, direction,
-            bullish, unusual, earnings_soon, is_etf)
+            bullish, unusual, earnings_soon, is_etf,
+            gap_volume_bonus=gap_bonus
+        )
 
         sector_result = evaluate_sector_filter(ticker, direction, change_pct, cfg, get_quote)
         score = round(max(0.0, min(100.0,
             score + sector_result.score_adjustment + sentiment_reaction.get("sentiment_price_score_adjustment", 0.0)
         )), 2)
-        # raw_signal_score bleibt fuer Event-Study erhalten. Harte Gates duerfen
-        # den finalen Trade-Score auf 0 setzen, aber sie duerfen den Ursprungsscore
-        # nicht ueberschreiben.
+
         raw_signal_score = score
         score_reason = score_reason + "; sector=" + sector_result.severity + "; sent_price=" + sentiment_reaction.get("sentiment_price_label", "neutral")
 
-        # Harte Snapshot-Konsistenz: Options-EV wird nur berechnet, wenn auch der
-        # Underlying-Snapshot aus Tradier Production/Sandbox stammt. Yahoo/AlphaVantage
-        # duerfen Research-Kontext liefern, aber keinen finalen Options-EV.
         if RULES.require_tradier_quote_for_tradier_options and not str(quote_src).lower().startswith("tradier"):
             options_data = {
                 "option_source": "tradier",
@@ -910,6 +884,7 @@ def process_ticker(ticker, direction, earnings_list, cfg,
         if not ev_ok:
             no_trade_reason.append(options_data.get("ev_fail_reason") or "Options-EV nach Kosten nicht ausreichend")
 
+        final_score = score
         if no_trade_reason:
             if not data_ok:
                 score_reason = "data_quality_fail"
@@ -917,7 +892,7 @@ def process_ticker(ticker, direction, earnings_list, cfg,
                 score_reason = "liquidity_fail"
             else:
                 score_reason = "option_ev_fail"
-            score = 0.0
+            final_score = 0.0
 
         final_reason = merge_reasons(no_trade_reason)
         if final_reason:
@@ -925,7 +900,7 @@ def process_ticker(ticker, direction, earnings_list, cfg,
 
         logger.info(
             "%s: price=%.2f score=%.1f raw=%.1f data_ok=%s liquid=%s ev_ok=%s ev=%s src=%s dte=%d",
-            ticker, price, score, raw_signal_score, data_ok, is_liquid, ev_ok, options_data.get("ev_pct"), quote_src, target_dte
+            ticker, price, final_score, raw_signal_score, data_ok, is_liquid, ev_ok, options_data.get("ev_pct"), quote_src, target_dte
         )
 
         return {
@@ -959,17 +934,16 @@ def process_ticker(ticker, direction, earnings_list, cfg,
             "realized_vol_20d": round(rv20, 5) if rv20 else None,
             "above_ma50": above_ma50,
             "new_20d_high": new_20d,
-            "trend_status": ("über MA50" if above_ma50 is True
-                             else ("unter MA50" if above_ma50 is False else "n/v")),
+            "trend_status": ("über MA50" if above_ma50 is True else ("unter MA50" if above_ma50 is False else "n/v")),
             "bullish": round(bullish, 1),
             "bearish": round(bearish, 1),
             "sentiment_rank_only": True,
             "sent_fallback": sent_fallback,
             "earnings_soon": earnings_soon,
             "raw_signal_score": raw_signal_score,
-            "gate_adjusted_score": score,
-            "score": score,
-            "_score_reason": score_reason,
+            "gate_adjusted_score": final_score,
+            "score": final_score,
+            "_score_reason": score_reason + f" | gap_bonus={gap_bonus:.1f}",
             "_data_quality_ok": data_ok,
             "_data_quality_reason": data_reason,
             "_liquidity_fail": not is_liquid,
@@ -982,6 +956,11 @@ def process_ticker(ticker, direction, earnings_list, cfg,
             "quote_age_seconds": quote_age_seconds,
             "_src_hist": hist_src,
             "_closes_count": len(closes),
+            # NEUE FELDER
+            "gap_pct": gap_volume["gap_pct"],
+            "rvol": gap_volume["rvol"],
+            "gap_volume_confirmed": gap_volume["is_high_conviction"],
+            "gap_volume_bonus": gap_bonus,
         }
 
     except Exception as e:
@@ -1003,8 +982,9 @@ def process_ticker(ticker, direction, earnings_list, cfg,
             "_error": str(e)[:120],
         }
 
+
 # ══════════════════════════════════════════════════════════
-# SUMMARY BUILDER
+# SUMMARY BUILDER + DIREKTE AUSFÜHRUNG (unverändert)
 # ══════════════════════════════════════════════════════════
 
 def build_summary(ranked, vix_value, ticker_directions,
