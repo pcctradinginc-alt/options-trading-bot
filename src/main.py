@@ -1,5 +1,6 @@
 """
-main.py — Daily Options Report Pipeline (mit simple_journal)
+main.py — Daily Options Report Pipeline (mit simple_journal + neuen Hard Gates)
+v13: Integrierte TradingRules (evaluate_trade + calculate_position_size)
 """
 
 import argparse
@@ -21,17 +22,14 @@ from report_generator import call_claude, build_html, send_email
 from rules import parse_ticker_signals, RULES
 from simple_journal import journal
 
-
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     fmt = "%(asctime)s %(levelname)-8s %(name)s — %(message)s"
     datefmt = "%H:%M:%S"
     logging.basicConfig(level=level, format=fmt, datefmt=datefmt)
-
     for noisy in ("urllib3", "requests", "httpcore", "httpx", "huggingface_hub",
                   "transformers", "torch", "filelock"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +40,6 @@ def _no_trade_html(today: str, vix=None, market_status: str = "",
     vix_str = str(vix) if vix and vix != "n/v" else "n/v"
     status_str = market_status or "unbekannt"
     clusters = clusters or []
-
     cluster_rows = ""
     for c in clusters[:5]:
         conf = c.get("confidence_score", 0)
@@ -56,9 +53,7 @@ def _no_trade_html(today: str, vix=None, market_status: str = "",
                         f'<td style="padding:6px 8px;text-align:center;">{conf:.2f}</td>' \
                         f'<td style="padding:6px 8px;text-align:center;">{sent_icon}{src_badge}</td>' \
                         f'<td style="padding:6px 8px;color:#86868b;">{head}</td></tr>'
-
     cluster_section = f'<div style="margin-top:20px;">... {cluster_rows} ...</div>' if cluster_rows else ""
-
     return f'''<html><head><meta charset="UTF-8"></head><body style="background:#f5f5f7;">
     <div style="max-width:520px;margin:0 auto;padding:32px 16px;background:white;border-radius:18px;">
         <h2>Daily Options Report — {today}</h2>
@@ -126,22 +121,13 @@ def main() -> int:
     earnings_map = build_earnings_map(cfg.get("finnhub_key", ""))
     clusters = cluster_articles(articles, earnings_map)
 
-    # Diagnostik: was hat die Ticker-Auflösung gefunden?
-    logger.info("Nach Ticker-Filterung: %d Cluster übrig (von %d Artikeln)",
-                len(clusters), len(articles))
+    logger.info("Nach Ticker-Filterung: %d Cluster übrig (von %d Artikeln)", len(clusters), len(articles))
     if clusters:
-        top = sorted(clusters, key=lambda c: c.get("confidence_score", 0),
-                     reverse=True)[:5]
+        top = sorted(clusters, key=lambda c: c.get("confidence_score", 0), reverse=True)[:5]
         for c in top:
-            logger.info("  → %s (conf=%.1f, %s): %s",
+            logger.info(" → %s (conf=%.1f, %s): %s",
                         c["ticker"], c["confidence_score"],
                         c["event_type"], c["headline_repr"][:80])
-    else:
-        # Wenn 0 Cluster: zeige ein paar Original-Headlines, damit man sieht,
-        # was die Resolver-Logik nicht gematcht hat
-        logger.info("Keine Cluster — Beispiel-Headlines, die nicht gematcht wurden:")
-        for art in articles[:5]:
-            logger.info("  ✗ %s", art.get("title", "")[:100])
 
     cluster_text = format_clusters_for_claude(clusters)
     market_time, market_status = get_market_context()
@@ -150,7 +136,6 @@ def main() -> int:
         cluster_text, market_time, market_status, cfg.get("anthropic_api_key", "")
     )
     vix_value = get_vix()
-
     logger.info("Claude Signal: %s | VIX: %s", ticker_signals[:100], vix_value)
 
     if ticker_signals in ("TICKER_SIGNALS:NONE", "", None):
@@ -163,7 +148,6 @@ def main() -> int:
     # STEP 2: Marktdaten
     logger.info("[2/3] Marktdaten...")
     t2 = time.monotonic()
-
     parsed_signals = parse_ticker_signals(ticker_signals)
     if not parsed_signals:
         logger.error("Keine gültigen Ticker geparst")
@@ -197,37 +181,52 @@ def main() -> int:
     market_data = [r for r in results if r]
     _enrich_market_data_with_cluster_context(market_data, clusters)
 
-    # === WICHTIG: Journalisieren ===
+    # === NEU: Hard-Gate Prüfung mit evaluate_trade + Position Sizing ===
+    logger.info("[2.5/3] Hard-Gate Prüfung + Position Sizing...")
+    executed = []
+    skipped = []
+
+    for d in market_data:
+        ticker = d["ticker"]
+        news_alpha = d.get("news_confidence_score", 50)   # aus Cluster-Kontext
+        ticker_info = {"market_cap": 999_999_999, "price": d["price"], "spread_pct": 5.0}  # Platzhalter – später erweitern
+
+        passed, reason = RULES.evaluate_trade(
+            ticker_info=ticker_info,
+            market_metrics=d,
+            news_alpha=news_alpha
+        )
+
+        if passed and d.get("score", 0) >= RULES.min_score:
+            total_conviction = round(
+                (news_alpha * 0.55) + (d.get("score", 50) * 0.45), 2
+            )
+            pos_size = RULES.calculate_position_size(total_conviction, 250_000)
+
+            logger.info(f"✅ ALARM: {ticker} HIGH CONVICTION | Conviction={total_conviction} | Size=${pos_size:,.0f}")
+
+            executed.append({
+                "ticker": ticker,
+                "direction": d.get("news_direction"),
+                "conviction": total_conviction,
+                "position_size": pos_size,
+                "reason": "All gates passed"
+            })
+        else:
+            skipped.append({"ticker": ticker, "reason": reason})
+
     journal.log_signals(parsed_signals, market_data, clusters)
-
-    ranked = sorted(market_data, key=lambda x: x.get("score", 0), reverse=True)
-
-    logger.info("Marktdaten fertig (%.1fs) — %d valide Ticker", time.monotonic() - t2, len(market_data))
-
-    # No-Trade Check
-    if not any(
-        d.get("score", 0) >= RULES.min_score and
-        d.get("_data_quality_ok", False) and
-        d.get("options", {}).get("ev_ok", False)
-        for d in ranked
-    ):
-        data = {"no_trade": True, "no_trade_grund": "Keine qualifizierten Trades", "vix": vix_value}
-        journal.log_decision(data)
-        html = _no_trade_html(today, vix_value, market_status, clusters[:3], "Keine qualifizierten Trades")
-        _send_or_save(html, f"⏸️ Daily Options Report – No Trade – {today}", cfg, args.dry_run)
-        return 0
 
     # STEP 3: Report
     logger.info("[3/3] Report generieren...")
     try:
-        market_summary = build_summary(ranked, vix_value, ticker_directions, earnings_list, [], [])
+        market_summary = build_summary(market_data, vix_value, ticker_directions, earnings_list, [], [])
         data = call_claude(market_summary, cfg.get("anthropic_api_key", ""), vix_direct=vix_value)
         journal.log_decision(data)
 
         html_report = build_html(data, today)
-        no_trade = data.get("no_trade", False)
-        ticker = data.get("ticker", "")
-        subject = f"⏸️ No Trade – {today}" if no_trade else f"📊 {ticker} – {today}"
+        no_trade = data.get("no_trade", False) or len(executed) == 0
+        subject = f"⏸️ No Trade – {today}" if no_trade else f"📊 Trade-Alarm – {today}"
         _send_or_save(html_report, subject, cfg, args.dry_run)
     except Exception as e:
         logger.error("Report-Fehler: %s", e)
@@ -235,7 +234,8 @@ def main() -> int:
         journal.log_decision(data)
         _send_or_save(_error_html(str(e), today), f"⚠️ Report Fehler – {today}", cfg, args.dry_run)
 
-    logger.info("✅ Gesamtlauf beendet in %.1fs", time.monotonic() - t_start)
+    logger.info("✅ Gesamtlauf beendet in %.1fs | Executed: %d | Skipped: %d",
+                time.monotonic() - t_start, len(executed), len(skipped))
     return 0
 
 
